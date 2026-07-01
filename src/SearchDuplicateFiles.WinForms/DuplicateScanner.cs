@@ -4,14 +4,16 @@ using System.Security.Cryptography;
 namespace SearchDuplicateFiles.WinForms;
 
 public sealed record ScanOptions(
-    string RootPath,
+    IReadOnlyList<string> RootPaths,
     bool IncludeSubdirectories,
     bool IncludeHiddenAndSystemFiles,
+    bool OnlyShowAcrossDifferentRootFolders,
     long MinimumSizeBytes,
     IReadOnlyList<string> SearchPatterns);
 
 public sealed record DuplicateFile(
     string FullPath,
+    string RootPath,
     long Size,
     DateTime LastWriteTimeUtc,
     string Sha256);
@@ -55,6 +57,7 @@ public sealed record ScanProgress(
 public sealed class DuplicateScanner
 {
     private const int BufferSize = 1024 * 1024;
+    private const int ProgressIntervalMilliseconds = 120;
 
     public async Task<DuplicateScanResult> ScanAsync(
         ScanOptions options,
@@ -63,21 +66,42 @@ public sealed class DuplicateScanner
     {
         ArgumentNullException.ThrowIfNull(options);
 
-        if (string.IsNullOrWhiteSpace(options.RootPath))
+        var rootPaths = NormalizeRootPaths(options.RootPaths).ToArray();
+        if (rootPaths.Length == 0)
         {
-            throw new ArgumentException("Root path is required.", nameof(options));
+            throw new ArgumentException("At least one root path is required.", nameof(options));
         }
 
         var stopwatch = Stopwatch.StartNew();
+        var progressStopwatch = Stopwatch.StartNew();
         var warnings = new List<string>();
         var filesBySize = new Dictionary<long, List<FileCandidate>>();
         var seenPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var filesSeen = 0;
 
-        foreach (var pattern in NormalizePatterns(options.SearchPatterns))
+        void ReportProgress(ScanProgress scanProgress, bool force = false)
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            EnumerateFiles(options, pattern, seenPaths, filesBySize, warnings, progress, ref filesSeen, cancellationToken);
+            if (progress is null)
+            {
+                return;
+            }
+
+            if (!force && progressStopwatch.ElapsedMilliseconds < ProgressIntervalMilliseconds)
+            {
+                return;
+            }
+
+            progress.Report(scanProgress);
+            progressStopwatch.Restart();
+        }
+
+        foreach (var rootPath in rootPaths)
+        {
+            foreach (var pattern in NormalizePatterns(options.SearchPatterns))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                EnumerateFiles(rootPath, options, pattern, seenPaths, filesBySize, warnings, ReportProgress, ref filesSeen, cancellationToken);
+            }
         }
 
         var candidateFiles = filesBySize
@@ -87,7 +111,7 @@ public sealed class DuplicateScanner
             .ThenBy(file => file.FullPath, StringComparer.OrdinalIgnoreCase)
             .ToList();
 
-        progress?.Report(new ScanProgress(ScanStage.Hashing, filesSeen, candidateFiles.Count, 0, 0, null));
+        ReportProgress(new ScanProgress(ScanStage.Hashing, filesSeen, candidateFiles.Count, 0, 0, null), force: true);
 
         var hashedFiles = new Dictionary<string, List<DuplicateFile>>(StringComparer.OrdinalIgnoreCase);
         var filesHashed = 0;
@@ -95,7 +119,7 @@ public sealed class DuplicateScanner
         foreach (var candidate in candidateFiles)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            progress?.Report(new ScanProgress(
+            ReportProgress(new ScanProgress(
                 ScanStage.Hashing,
                 filesSeen,
                 candidateFiles.Count,
@@ -121,6 +145,7 @@ public sealed class DuplicateScanner
                 var hash = await ComputeSha256Async(candidate.FullPath, cancellationToken).ConfigureAwait(false);
                 var duplicateFile = new DuplicateFile(
                     candidate.FullPath,
+                    candidate.RootPath,
                     currentInfo.Length,
                     currentInfo.LastWriteTimeUtc,
                     hash);
@@ -146,29 +171,32 @@ public sealed class DuplicateScanner
         }
 
         var groups = hashedFiles.Values
-            .Where(files => files.Count > 1)
+            .Where(files => IsDuplicateGroup(files, options.OnlyShowAcrossDifferentRootFolders))
             .OrderByDescending(files => (files.Count - 1) * files[0].Size)
             .ThenByDescending(files => files[0].Size)
             .Select((files, index) => new DuplicateFileGroup(
                 index + 1,
                 files[0].Size,
                 files[0].Sha256,
-                files.OrderBy(file => file.FullPath, StringComparer.OrdinalIgnoreCase).ToArray()))
+                files.OrderBy(file => file.RootPath, StringComparer.OrdinalIgnoreCase)
+                    .ThenBy(file => file.FullPath, StringComparer.OrdinalIgnoreCase)
+                    .ToArray()))
             .ToArray();
 
         stopwatch.Stop();
-        progress?.Report(new ScanProgress(ScanStage.Finished, filesSeen, candidateFiles.Count, filesHashed, groups.Length, null));
+        ReportProgress(new ScanProgress(ScanStage.Finished, filesSeen, candidateFiles.Count, filesHashed, groups.Length, null), force: true);
 
         return new DuplicateScanResult(groups, filesSeen, candidateFiles.Count, filesHashed, warnings, stopwatch.Elapsed);
     }
 
     private static void EnumerateFiles(
+        string rootPath,
         ScanOptions options,
         string pattern,
         HashSet<string> seenPaths,
         Dictionary<long, List<FileCandidate>> filesBySize,
         List<string> warnings,
-        IProgress<ScanProgress>? progress,
+        Action<ScanProgress, bool> reportProgress,
         ref int filesSeen,
         CancellationToken cancellationToken)
     {
@@ -176,11 +204,11 @@ public sealed class DuplicateScanner
 
         try
         {
-            files = Directory.EnumerateFiles(options.RootPath, pattern, CreateEnumerationOptions(options));
+            files = Directory.EnumerateFiles(rootPath, pattern, CreateEnumerationOptions(options));
         }
         catch (Exception ex) when (IsExpectedFileException(ex))
         {
-            warnings.Add($"列挙できませんでした: {options.RootPath} / {pattern} ({ex.Message})");
+            warnings.Add($"列挙できませんでした: {rootPath} / {pattern} ({ex.Message})");
             return;
         }
 
@@ -196,7 +224,7 @@ public sealed class DuplicateScanner
                 }
 
                 filesSeen++;
-                progress?.Report(new ScanProgress(ScanStage.Enumerating, filesSeen, 0, 0, 0, path));
+                reportProgress(new ScanProgress(ScanStage.Enumerating, filesSeen, 0, 0, 0, path), false);
 
                 FileInfo fileInfo;
                 try
@@ -219,12 +247,12 @@ public sealed class DuplicateScanner
                     filesBySize[fileInfo.Length] = list;
                 }
 
-                list.Add(new FileCandidate(fileInfo.FullName, fileInfo.Length));
+                list.Add(new FileCandidate(fileInfo.FullName, rootPath, fileInfo.Length));
             }
         }
         catch (Exception ex) when (IsExpectedFileException(ex))
         {
-            warnings.Add($"列挙中にエラーが発生しました: {options.RootPath} / {pattern} ({ex.Message})");
+            warnings.Add($"列挙中にエラーが発生しました: {rootPath} / {pattern} ({ex.Message})");
         }
     }
 
@@ -260,6 +288,16 @@ public sealed class DuplicateScanner
         return Convert.ToHexString(hash);
     }
 
+    private static IEnumerable<string> NormalizeRootPaths(IReadOnlyList<string> rootPaths)
+    {
+        return rootPaths
+            .Where(path => !string.IsNullOrWhiteSpace(path))
+            .Select(path => Path.TrimEndingDirectorySeparator(Path.GetFullPath(path.Trim())))
+            .Where(Directory.Exists)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
     private static IEnumerable<string> NormalizePatterns(IReadOnlyList<string> patterns)
     {
         var normalized = patterns
@@ -269,6 +307,17 @@ public sealed class DuplicateScanner
             .ToArray();
 
         return normalized.Length == 0 ? new[] { "*" } : normalized;
+    }
+
+    private static bool IsDuplicateGroup(IReadOnlyList<DuplicateFile> files, bool onlyShowAcrossDifferentRootFolders)
+    {
+        if (files.Count <= 1)
+        {
+            return false;
+        }
+
+        return !onlyShowAcrossDifferentRootFolders
+            || files.Select(file => file.RootPath).Distinct(StringComparer.OrdinalIgnoreCase).Count() > 1;
     }
 
     private static bool IsExpectedFileException(Exception ex)
@@ -281,5 +330,5 @@ public sealed class DuplicateScanner
             or PathTooLongException;
     }
 
-    private sealed record FileCandidate(string FullPath, long Size);
+    private sealed record FileCandidate(string FullPath, string RootPath, long Size);
 }

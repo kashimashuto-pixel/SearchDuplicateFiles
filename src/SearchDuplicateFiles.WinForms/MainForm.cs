@@ -7,12 +7,29 @@ namespace SearchDuplicateFiles.WinForms;
 
 public sealed class MainForm : Form
 {
-    private readonly TextBox _folderTextBox = new();
+    private const string AppTitle = "Search Duplicate Files";
+
+    private static readonly Color[] GroupBackColors =
+    {
+        Color.FromArgb(255, 249, 219),
+        Color.FromArgb(226, 244, 255),
+        Color.FromArgb(226, 247, 232),
+        Color.FromArgb(255, 232, 238),
+        Color.FromArgb(239, 234, 255),
+        Color.FromArgb(224, 247, 244),
+        Color.FromArgb(255, 238, 218),
+        Color.FromArgb(239, 244, 248)
+    };
+
+    private readonly ListBox _folderListBox = new();
     private readonly TextBox _patternTextBox = new();
     private readonly NumericUpDown _minimumSizeBox = new();
     private readonly CheckBox _recursiveCheckBox = new();
     private readonly CheckBox _includeHiddenCheckBox = new();
-    private readonly Button _browseButton = new();
+    private readonly CheckBox _onlyAcrossFoldersCheckBox = new();
+    private readonly Button _addFolderButton = new();
+    private readonly Button _removeFolderButton = new();
+    private readonly Button _clearFoldersButton = new();
     private readonly Button _scanButton = new();
     private readonly Button _cancelButton = new();
     private readonly Button _exportButton = new();
@@ -30,13 +47,15 @@ public sealed class MainForm : Form
     private CancellationTokenSource? _scanCancellation;
     private IReadOnlyList<string> _lastWarnings = Array.Empty<string>();
     private bool _isScanning;
+    private bool _lastOnlyAcrossFolders;
+    private int _lastScannedFolderCount;
 
     public MainForm()
     {
-        Text = "Search Duplicate Files";
+        Text = AppTitle;
         StartPosition = FormStartPosition.CenterScreen;
-        MinimumSize = new Size(980, 620);
-        Size = new Size(1180, 760);
+        MinimumSize = new Size(1040, 680);
+        Size = new Size(1260, 800);
 
         BuildLayout();
         WireEvents();
@@ -75,7 +94,9 @@ public sealed class MainForm : Form
         {
             Dock = DockStyle.Fill,
             ColumnCount = 3,
-            AutoSize = true
+            RowCount = 1,
+            AutoSize = true,
+            Margin = new Padding(0, 0, 0, 10)
         };
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
@@ -85,19 +106,39 @@ public sealed class MainForm : Form
         {
             Text = "対象フォルダー",
             AutoSize = true,
-            Anchor = AnchorStyles.Left,
-            Margin = new Padding(0, 6, 8, 0)
+            Anchor = AnchorStyles.Top | AnchorStyles.Left,
+            Margin = new Padding(0, 6, 12, 0)
         };
 
-        _folderTextBox.Anchor = AnchorStyles.Left | AnchorStyles.Right;
-        _folderTextBox.Margin = new Padding(0, 0, 8, 0);
+        _folderListBox.Dock = DockStyle.Fill;
+        _folderListBox.Height = 96;
+        _folderListBox.HorizontalScrollbar = true;
+        _folderListBox.IntegralHeight = false;
+        _folderListBox.SelectionMode = SelectionMode.MultiExtended;
+        _folderListBox.Margin = new Padding(0, 0, 10, 0);
 
-        _browseButton.Text = "参照...";
-        _browseButton.AutoSize = true;
+        var buttons = new FlowLayoutPanel
+        {
+            AutoSize = true,
+            FlowDirection = FlowDirection.TopDown,
+            WrapContents = false,
+            Margin = new Padding(0)
+        };
+
+        _addFolderButton.Text = "追加...";
+        _removeFolderButton.Text = "削除";
+        _clearFoldersButton.Text = "クリア";
+
+        foreach (var button in new[] { _addFolderButton, _removeFolderButton, _clearFoldersButton })
+        {
+            button.Width = 90;
+            button.Margin = new Padding(0, 0, 0, 6);
+            buttons.Controls.Add(button);
+        }
 
         layout.Controls.Add(label, 0, 0);
-        layout.Controls.Add(_folderTextBox, 1, 0);
-        layout.Controls.Add(_browseButton, 2, 0);
+        layout.Controls.Add(_folderListBox, 1, 0);
+        layout.Controls.Add(buttons, 2, 0);
         return layout;
     }
 
@@ -108,7 +149,7 @@ public sealed class MainForm : Form
             Dock = DockStyle.Fill,
             AutoSize = true,
             WrapContents = true,
-            Margin = new Padding(0, 10, 0, 10)
+            Margin = new Padding(0, 0, 0, 10)
         };
 
         _recursiveCheckBox.Text = "サブフォルダーも検索";
@@ -119,6 +160,11 @@ public sealed class MainForm : Form
         _includeHiddenCheckBox.Text = "隠し/システムを含める";
         _includeHiddenCheckBox.AutoSize = true;
         _includeHiddenCheckBox.Margin = new Padding(0, 6, 16, 0);
+
+        _onlyAcrossFoldersCheckBox.Text = "対象フォルダー間の重複だけ表示";
+        _onlyAcrossFoldersCheckBox.AutoSize = true;
+        _onlyAcrossFoldersCheckBox.Margin = new Padding(0, 6, 16, 0);
+        _toolTip.SetToolTip(_onlyAcrossFoldersCheckBox, "2つ以上の対象フォルダーにまたがる重複だけを表示します。");
 
         var patternLabel = new Label
         {
@@ -154,6 +200,7 @@ public sealed class MainForm : Form
 
         panel.Controls.Add(_recursiveCheckBox);
         panel.Controls.Add(_includeHiddenCheckBox);
+        panel.Controls.Add(_onlyAcrossFoldersCheckBox);
         panel.Controls.Add(patternLabel);
         panel.Controls.Add(_patternTextBox);
         panel.Controls.Add(minimumSizeLabel);
@@ -179,11 +226,12 @@ public sealed class MainForm : Form
         _resultsGrid.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
         _resultsGrid.DataSource = _rows;
 
-        _resultsGrid.Columns.Add(CreateTextColumn(nameof(DuplicateFileRow.GroupNumber), "グループ", 72, 8));
-        _resultsGrid.Columns.Add(CreateTextColumn(nameof(DuplicateFileRow.FileName), "ファイル名", 180, 22));
-        _resultsGrid.Columns.Add(CreateTextColumn(nameof(DuplicateFileRow.Folder), "フォルダー", 260, 34));
-        _resultsGrid.Columns.Add(CreateTextColumn(nameof(DuplicateFileRow.SizeText), "サイズ", 100, 10));
-        _resultsGrid.Columns.Add(CreateTextColumn(nameof(DuplicateFileRow.LastWriteLocalText), "更新日時", 140, 14));
+        _resultsGrid.Columns.Add(CreateTextColumn(nameof(DuplicateFileRow.GroupNumber), "グループ", 72, 7));
+        _resultsGrid.Columns.Add(CreateTextColumn(nameof(DuplicateFileRow.TargetFolder), "対象", 120, 12));
+        _resultsGrid.Columns.Add(CreateTextColumn(nameof(DuplicateFileRow.FileName), "ファイル名", 180, 20));
+        _resultsGrid.Columns.Add(CreateTextColumn(nameof(DuplicateFileRow.Folder), "フォルダー", 260, 32));
+        _resultsGrid.Columns.Add(CreateTextColumn(nameof(DuplicateFileRow.SizeText), "サイズ", 100, 9));
+        _resultsGrid.Columns.Add(CreateTextColumn(nameof(DuplicateFileRow.LastWriteLocalText), "更新日時", 140, 12));
         _resultsGrid.Columns.Add(CreateTextColumn(nameof(DuplicateFileRow.Sha256), "SHA-256", 220, 18));
 
         return _resultsGrid;
@@ -241,14 +289,14 @@ public sealed class MainForm : Form
             RowCount = 1,
             AutoSize = true
         };
-        statusRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 220));
+        statusRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 240));
         statusRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
 
         _progressBar.Dock = DockStyle.Fill;
         _progressBar.Height = 18;
         _progressBar.Margin = new Padding(0, 2, 10, 0);
 
-        _statusLabel.Text = "対象フォルダーを選択してください。";
+        _statusLabel.Text = "対象フォルダーを追加してください。";
         _statusLabel.AutoEllipsis = true;
         _statusLabel.Dock = DockStyle.Fill;
         _statusLabel.TextAlign = ContentAlignment.MiddleLeft;
@@ -263,7 +311,9 @@ public sealed class MainForm : Form
 
     private void WireEvents()
     {
-        _browseButton.Click += BrowseButton_Click;
+        _addFolderButton.Click += AddFolderButton_Click;
+        _removeFolderButton.Click += RemoveFolderButton_Click;
+        _clearFoldersButton.Click += ClearFoldersButton_Click;
         _scanButton.Click += ScanButton_Click;
         _cancelButton.Click += CancelButton_Click;
         _exportButton.Click += ExportButton_Click;
@@ -271,58 +321,99 @@ public sealed class MainForm : Form
         _openFolderButton.Click += OpenFolderButton_Click;
         _recycleButton.Click += RecycleButton_Click;
         _warningsButton.Click += WarningsButton_Click;
+        _folderListBox.SelectedIndexChanged += (_, _) => UpdateActionButtons();
         _resultsGrid.SelectionChanged += (_, _) => UpdateActionButtons();
+        _resultsGrid.RowPrePaint += ResultsGrid_RowPrePaint;
     }
 
-    private void BrowseButton_Click(object? sender, EventArgs e)
+    private void AddFolderButton_Click(object? sender, EventArgs e)
     {
+        var selectedPath = _folderListBox.SelectedItem as string
+            ?? _folderListBox.Items.Cast<string>().LastOrDefault()
+            ?? Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
+
         using var dialog = new FolderBrowserDialog
         {
             Description = "重複ファイルを検索するフォルダーを選択してください",
             UseDescriptionForTitle = true,
-            SelectedPath = Directory.Exists(_folderTextBox.Text) ? _folderTextBox.Text : Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments)
+            SelectedPath = Directory.Exists(selectedPath) ? selectedPath : Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments)
         };
 
         if (dialog.ShowDialog(this) == DialogResult.OK)
         {
-            _folderTextBox.Text = dialog.SelectedPath;
+            AddFolder(dialog.SelectedPath);
         }
+    }
+
+    private void RemoveFolderButton_Click(object? sender, EventArgs e)
+    {
+        var selectedFolders = _folderListBox.SelectedItems.Cast<string>().ToArray();
+        foreach (var folder in selectedFolders)
+        {
+            _folderListBox.Items.Remove(folder);
+        }
+
+        UpdateActionButtons();
+    }
+
+    private void ClearFoldersButton_Click(object? sender, EventArgs e)
+    {
+        _folderListBox.Items.Clear();
+        UpdateActionButtons();
     }
 
     private async void ScanButton_Click(object? sender, EventArgs e)
     {
-        var rootPath = _folderTextBox.Text.Trim();
-        if (!Directory.Exists(rootPath))
+        var rootPaths = GetTargetFolders();
+        if (rootPaths.Count == 0)
         {
-            MessageBox.Show(this, "存在するフォルダーを指定してください。", "フォルダー確認", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            MessageBox.Show(this, "対象フォルダーを1つ以上追加してください。", "フォルダー確認", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
 
+        var missingFolders = rootPaths.Where(path => !Directory.Exists(path)).ToArray();
+        if (missingFolders.Length > 0)
+        {
+            MessageBox.Show(this, string.Join(Environment.NewLine, missingFolders), "存在しないフォルダー", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        _lastOnlyAcrossFolders = _onlyAcrossFoldersCheckBox.Checked;
+        _lastScannedFolderCount = rootPaths.Count;
+
         var options = new ScanOptions(
-            rootPath,
+            rootPaths,
             _recursiveCheckBox.Checked,
             _includeHiddenCheckBox.Checked,
+            _lastOnlyAcrossFolders,
             Decimal.ToInt64(_minimumSizeBox.Value) * 1024L,
             ParsePatterns(_patternTextBox.Text));
 
         _scanCancellation = new CancellationTokenSource();
+        var cancellationToken = _scanCancellation.Token;
         _lastWarnings = Array.Empty<string>();
         _rows.Clear();
+        _statusLabel.Text = "スキャン準備中...";
+        Text = $"{AppTitle} - スキャン準備中";
         UpdateScanState(true);
 
         try
         {
             var progress = new Progress<ScanProgress>(UpdateProgress);
-            var result = await _scanner.ScanAsync(options, progress, _scanCancellation.Token);
+            var result = await Task.Run(() => _scanner.ScanAsync(options, progress, cancellationToken), cancellationToken);
             LoadResult(result);
         }
         catch (OperationCanceledException)
         {
+            _progressBar.Value = 0;
             _statusLabel.Text = "スキャンをキャンセルしました。";
+            Text = $"{AppTitle} - キャンセル";
         }
         catch (Exception ex)
         {
+            _progressBar.Value = 0;
             _statusLabel.Text = "スキャン中にエラーが発生しました。";
+            Text = $"{AppTitle} - エラー";
             MessageBox.Show(this, ex.Message, "スキャンエラー", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
         finally
@@ -360,18 +451,20 @@ public sealed class MainForm : Form
         }
 
         using var writer = new StreamWriter(dialog.FileName, false, new UTF8Encoding(encoderShouldEmitUTF8Identifier: true));
-        WriteCsvLine(writer, "Group", "FileName", "Folder", "SizeBytes", "LastWriteLocal", "SHA256", "FullPath");
+        WriteCsvLine(writer, "Group", "TargetFolder", "FileName", "Folder", "SizeBytes", "LastWriteLocal", "SHA256", "RootPath", "FullPath");
 
         foreach (var row in _rows)
         {
             WriteCsvLine(
                 writer,
                 row.GroupNumber.ToString(),
+                row.TargetFolder,
                 row.FileName,
                 row.Folder,
                 row.File.Size.ToString(),
                 row.LastWriteLocalText,
                 row.Sha256,
+                row.File.RootPath,
                 row.File.FullPath);
         }
 
@@ -466,6 +559,7 @@ public sealed class MainForm : Form
                 _rows.Add(row);
             }
 
+            _resultsGrid.ClearSelection();
             _statusLabel.Text = $"{removedPaths.Count:N0} 件をごみ箱へ移動しました。";
         }
 
@@ -493,6 +587,32 @@ public sealed class MainForm : Form
         MessageBox.Show(this, string.Join(Environment.NewLine, lines), "スキャン警告", MessageBoxButtons.OK, MessageBoxIcon.Warning);
     }
 
+    private void ResultsGrid_RowPrePaint(object? sender, DataGridViewRowPrePaintEventArgs e)
+    {
+        if (e.RowIndex < 0 || _resultsGrid.Rows[e.RowIndex].DataBoundItem is not DuplicateFileRow row)
+        {
+            return;
+        }
+
+        var style = _resultsGrid.Rows[e.RowIndex].DefaultCellStyle;
+        style.BackColor = GetGroupBackColor(row.GroupNumber);
+        style.SelectionBackColor = Color.FromArgb(54, 92, 130);
+        style.SelectionForeColor = Color.White;
+    }
+
+    private void AddFolder(string folderPath)
+    {
+        var normalized = NormalizeFolderPath(folderPath);
+        if (_folderListBox.Items.Cast<string>().Any(item => string.Equals(item, normalized, StringComparison.OrdinalIgnoreCase)))
+        {
+            return;
+        }
+
+        _folderListBox.Items.Add(normalized);
+        _folderListBox.SelectedItem = normalized;
+        UpdateActionButtons();
+    }
+
     private void LoadResult(DuplicateScanResult result)
     {
         _lastWarnings = result.Warnings;
@@ -506,17 +626,26 @@ public sealed class MainForm : Form
             }
         }
 
+        _resultsGrid.ClearSelection();
+        _resultsGrid.Refresh();
         _statusLabel.Text = CreateSummaryText(result);
+        Text = $"{AppTitle} - 完了";
         UpdateActionButtons();
     }
 
     private void UpdateProgress(ScanProgress progress)
     {
-        if (progress.Stage == ScanStage.Hashing && progress.CandidateFiles > 0)
+        if (progress.Stage == ScanStage.Hashing)
         {
             _progressBar.Style = ProgressBarStyle.Blocks;
             _progressBar.Maximum = Math.Max(1, progress.CandidateFiles);
             _progressBar.Value = Math.Min(_progressBar.Maximum, progress.FilesHashed);
+        }
+        else if (progress.Stage == ScanStage.Finished)
+        {
+            _progressBar.Style = ProgressBarStyle.Blocks;
+            _progressBar.Maximum = Math.Max(1, progress.CandidateFiles);
+            _progressBar.Value = _progressBar.Maximum;
         }
         else if (_isScanning)
         {
@@ -530,6 +659,14 @@ public sealed class MainForm : Form
             ScanStage.Finished => $"完了: {progress.DuplicateGroups:N0} グループ",
             _ => _statusLabel.Text
         };
+
+        Text = progress.Stage switch
+        {
+            ScanStage.Enumerating => $"{AppTitle} - 列挙中 ({progress.FilesSeen:N0} 件)",
+            ScanStage.Hashing => $"{AppTitle} - 内容確認中 ({progress.FilesHashed:N0}/{progress.CandidateFiles:N0})",
+            ScanStage.Finished => $"{AppTitle} - 完了",
+            _ => Text
+        };
     }
 
     private void UpdateScanState(bool isScanning)
@@ -537,20 +674,19 @@ public sealed class MainForm : Form
         _isScanning = isScanning;
         Cursor = isScanning ? Cursors.WaitCursor : Cursors.Default;
 
-        _folderTextBox.Enabled = !isScanning;
-        _browseButton.Enabled = !isScanning;
+        _folderListBox.Enabled = !isScanning;
         _recursiveCheckBox.Enabled = !isScanning;
         _includeHiddenCheckBox.Enabled = !isScanning;
+        _onlyAcrossFoldersCheckBox.Enabled = !isScanning;
         _patternTextBox.Enabled = !isScanning;
         _minimumSizeBox.Enabled = !isScanning;
-        _scanButton.Enabled = !isScanning;
         _cancelButton.Enabled = isScanning;
 
         if (isScanning)
         {
             _progressBar.Style = ProgressBarStyle.Marquee;
         }
-        else
+        else if (_progressBar.Style == ProgressBarStyle.Marquee)
         {
             _progressBar.Style = ProgressBarStyle.Blocks;
             _progressBar.Value = 0;
@@ -561,14 +697,36 @@ public sealed class MainForm : Form
 
     private void UpdateActionButtons()
     {
+        var hasFolders = _folderListBox.Items.Count > 0;
+        var canCompareFolders = _folderListBox.Items.Count > 1;
+        var hasFolderSelection = _folderListBox.SelectedItems.Count > 0;
         var hasRows = _rows.Count > 0;
-        var hasSelection = _resultsGrid.SelectedRows.Count > 0;
+        var hasResultSelection = _resultsGrid.SelectedRows.Count > 0;
 
+        if (!_isScanning && !canCompareFolders)
+        {
+            _onlyAcrossFoldersCheckBox.Checked = false;
+        }
+
+        _addFolderButton.Enabled = !_isScanning;
+        _removeFolderButton.Enabled = !_isScanning && hasFolderSelection;
+        _clearFoldersButton.Enabled = !_isScanning && hasFolders;
+        _scanButton.Enabled = !_isScanning && hasFolders;
+        _onlyAcrossFoldersCheckBox.Enabled = !_isScanning && canCompareFolders;
         _exportButton.Enabled = !_isScanning && hasRows;
-        _openFileButton.Enabled = !_isScanning && hasSelection;
-        _openFolderButton.Enabled = !_isScanning && hasSelection;
-        _recycleButton.Enabled = !_isScanning && hasSelection;
+        _openFileButton.Enabled = !_isScanning && hasResultSelection;
+        _openFolderButton.Enabled = !_isScanning && hasResultSelection;
+        _recycleButton.Enabled = !_isScanning && hasResultSelection;
         _warningsButton.Enabled = !_isScanning && _lastWarnings.Count > 0;
+    }
+
+    private IReadOnlyList<string> GetTargetFolders()
+    {
+        return _folderListBox.Items
+            .Cast<string>()
+            .Select(NormalizeFolderPath)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
     }
 
     private IEnumerable<DuplicateFileRow> GetSelectedRows()
@@ -587,13 +745,28 @@ public sealed class MainForm : Form
         return _rows
             .Where(row => !removedPaths.Contains(row.File.FullPath))
             .GroupBy(row => (row.File.Size, row.File.Sha256))
-            .Where(group => group.Count() > 1)
+            .Where(group => IsVisibleDuplicateGroup(group.Select(row => row.File), _lastOnlyAcrossFolders))
             .OrderByDescending(group => (group.Count() - 1) * group.Key.Size)
             .ThenByDescending(group => group.Key.Size)
             .SelectMany((group, index) => group
-                .OrderBy(row => row.File.FullPath, StringComparer.OrdinalIgnoreCase)
+                .OrderBy(row => row.File.RootPath, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(row => row.File.FullPath, StringComparer.OrdinalIgnoreCase)
                 .Select(row => new DuplicateFileRow(index + 1, row.File)))
             .ToList();
+    }
+
+    private string CreateSummaryText(DuplicateScanResult result)
+    {
+        var warningText = result.Warnings.Count == 0 ? string.Empty : $" / 警告 {result.Warnings.Count:N0} 件";
+        var comparisonText = _lastOnlyAcrossFolders ? " / フォルダー間のみ" : string.Empty;
+        var targetText = $"対象 {_lastScannedFolderCount:N0} フォルダー{comparisonText}";
+
+        if (result.Groups.Count == 0)
+        {
+            return $"完了: 重複は見つかりませんでした。{targetText} / 確認 {result.TotalFilesSeen:N0} 件 / ハッシュ {result.FilesHashed:N0} 件 / {result.Elapsed:mm\\:ss}{warningText}";
+        }
+
+        return $"完了: {result.Groups.Count:N0} グループ / 重複候補 {result.DuplicateFileCount:N0} 件 / 削減可能 {FormatSize(result.ReclaimableBytes)} / {targetText} / {result.Elapsed:mm\\:ss}{warningText}";
     }
 
     private static IReadOnlyList<string> ParsePatterns(string input)
@@ -606,16 +779,33 @@ public sealed class MainForm : Form
         return patterns.Length == 0 ? new[] { "*" } : patterns;
     }
 
-    private static string CreateSummaryText(DuplicateScanResult result)
+    private static string NormalizeFolderPath(string folderPath)
     {
-        var warningText = result.Warnings.Count == 0 ? string.Empty : $" / 警告 {result.Warnings.Count:N0} 件";
+        return Path.TrimEndingDirectorySeparator(Path.GetFullPath(folderPath.Trim()));
+    }
 
-        if (result.Groups.Count == 0)
+    private static bool IsVisibleDuplicateGroup(IEnumerable<DuplicateFile> files, bool onlyShowAcrossDifferentRootFolders)
+    {
+        var fileList = files.ToArray();
+        if (fileList.Length <= 1)
         {
-            return $"完了: 重複は見つかりませんでした。確認 {result.TotalFilesSeen:N0} 件 / ハッシュ {result.FilesHashed:N0} 件 / {result.Elapsed:mm\\:ss}{warningText}";
+            return false;
         }
 
-        return $"完了: {result.Groups.Count:N0} グループ / 重複候補 {result.DuplicateFileCount:N0} 件 / 削減可能 {FormatSize(result.ReclaimableBytes)} / {result.Elapsed:mm\\:ss}{warningText}";
+        return !onlyShowAcrossDifferentRootFolders
+            || fileList.Select(file => file.RootPath).Distinct(StringComparer.OrdinalIgnoreCase).Count() > 1;
+    }
+
+    private static Color GetGroupBackColor(int groupNumber)
+    {
+        return GroupBackColors[(groupNumber - 1) % GroupBackColors.Length];
+    }
+
+    private static string GetFolderDisplayName(string folder)
+    {
+        var trimmed = Path.TrimEndingDirectorySeparator(folder);
+        var name = Path.GetFileName(trimmed);
+        return string.IsNullOrWhiteSpace(name) ? folder : name;
     }
 
     private static string ShortenPath(string? path)
@@ -670,6 +860,8 @@ public sealed class MainForm : Form
         public int GroupNumber { get; }
 
         public DuplicateFile File { get; }
+
+        public string TargetFolder => GetFolderDisplayName(File.RootPath);
 
         public string FileName => Path.GetFileName(File.FullPath);
 
