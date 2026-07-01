@@ -1,0 +1,17 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>SearchDuplicateFiles</AssemblyName>
+    <RootNamespace>SearchDuplicateFiles.WinForms</RootNamespace>
+    <Product>Search Duplicate Files</Product>
+    <Description>Windows Forms duplicate file finder.</Description>
+    <Authors>kashimashuto-pixel</Authors>
+    <Version>1.0.0</Version>
+  </PropertyGroup>
+
+</Project>
