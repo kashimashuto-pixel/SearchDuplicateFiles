@@ -63,6 +63,12 @@ public sealed class MainForm : Form
         UpdateActionButtons();
     }
 
+    protected override void OnFormClosed(FormClosedEventArgs e)
+    {
+        TaskbarProgress.Clear(this);
+        base.OnFormClosed(e);
+    }
+
     private void BuildLayout()
     {
         SuspendLayout();
@@ -408,12 +414,14 @@ public sealed class MainForm : Form
             _progressBar.Value = 0;
             _statusLabel.Text = "スキャンをキャンセルしました。";
             Text = $"{AppTitle} - キャンセル";
+            TaskbarProgress.SetPaused(this);
         }
         catch (Exception ex)
         {
             _progressBar.Value = 0;
             _statusLabel.Text = "スキャン中にエラーが発生しました。";
             Text = $"{AppTitle} - エラー";
+            TaskbarProgress.SetError(this);
             MessageBox.Show(this, ex.Message, "スキャンエラー", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
         finally
@@ -640,16 +648,19 @@ public sealed class MainForm : Form
             _progressBar.Style = ProgressBarStyle.Blocks;
             _progressBar.Maximum = Math.Max(1, progress.CandidateFiles);
             _progressBar.Value = Math.Min(_progressBar.Maximum, progress.FilesHashed);
+            TaskbarProgress.SetNormal(this, progress.FilesHashed, progress.CandidateFiles);
         }
         else if (progress.Stage == ScanStage.Finished)
         {
             _progressBar.Style = ProgressBarStyle.Blocks;
             _progressBar.Maximum = Math.Max(1, progress.CandidateFiles);
             _progressBar.Value = _progressBar.Maximum;
+            TaskbarProgress.SetNormal(this, _progressBar.Value, _progressBar.Maximum);
         }
         else if (_isScanning)
         {
             _progressBar.Style = ProgressBarStyle.Marquee;
+            TaskbarProgress.SetIndeterminate(this);
         }
 
         _statusLabel.Text = progress.Stage switch
@@ -685,11 +696,17 @@ public sealed class MainForm : Form
         if (isScanning)
         {
             _progressBar.Style = ProgressBarStyle.Marquee;
+            TaskbarProgress.SetIndeterminate(this);
         }
         else if (_progressBar.Style == ProgressBarStyle.Marquee)
         {
             _progressBar.Style = ProgressBarStyle.Blocks;
             _progressBar.Value = 0;
+        }
+
+        if (!isScanning)
+        {
+            TaskbarProgress.Clear(this);
         }
 
         UpdateActionButtons();
