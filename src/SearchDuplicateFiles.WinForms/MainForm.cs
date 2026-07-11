@@ -22,7 +22,8 @@ public sealed class MainForm : Form
     };
 
     private readonly ListBox _folderListBox = new();
-    private readonly TextBox _patternTextBox = new();
+    private readonly TextBox _fileNamePatternTextBox = new();
+    private readonly TextBox _folderNamePatternTextBox = new();
     private readonly NumericUpDown _minimumSizeBox = new();
     private readonly CheckBox _recursiveCheckBox = new();
     private readonly CheckBox _includeHiddenCheckBox = new();
@@ -49,6 +50,8 @@ public sealed class MainForm : Form
     private bool _isScanning;
     private bool _lastOnlyAcrossFolders;
     private int _lastScannedFolderCount;
+    private string? _sortPropertyName;
+    private ListSortDirection _sortDirection = ListSortDirection.Ascending;
 
     public MainForm()
     {
@@ -172,17 +175,29 @@ public sealed class MainForm : Form
         _onlyAcrossFoldersCheckBox.Margin = new Padding(0, 6, 16, 0);
         _toolTip.SetToolTip(_onlyAcrossFoldersCheckBox, "2つ以上の対象フォルダーにまたがる重複だけを表示します。");
 
-        var patternLabel = new Label
+        var fileNamePatternLabel = new Label
         {
-            Text = "パターン",
+            Text = "ファイル名",
             AutoSize = true,
             Margin = new Padding(0, 7, 6, 0)
         };
 
-        _patternTextBox.Text = "*";
-        _patternTextBox.Width = 140;
-        _patternTextBox.Margin = new Padding(0, 3, 16, 0);
-        _toolTip.SetToolTip(_patternTextBox, "*.jpg;*.png のように ; 区切りで指定できます。");
+        _fileNamePatternTextBox.Text = "*";
+        _fileNamePatternTextBox.Width = 130;
+        _fileNamePatternTextBox.Margin = new Padding(0, 3, 16, 0);
+        _toolTip.SetToolTip(_fileNamePatternTextBox, "*.jpg;*.png のように ; 区切りで指定できます。");
+
+        var folderNamePatternLabel = new Label
+        {
+            Text = "フォルダー名",
+            AutoSize = true,
+            Margin = new Padding(0, 7, 6, 0)
+        };
+
+        _folderNamePatternTextBox.Text = "*";
+        _folderNamePatternTextBox.Width = 130;
+        _folderNamePatternTextBox.Margin = new Padding(0, 3, 16, 0);
+        _toolTip.SetToolTip(_folderNamePatternTextBox, "ファイルの親フォルダー名を temp*;backup のように ; 区切りで指定できます。");
 
         var minimumSizeLabel = new Label
         {
@@ -207,8 +222,10 @@ public sealed class MainForm : Form
         panel.Controls.Add(_recursiveCheckBox);
         panel.Controls.Add(_includeHiddenCheckBox);
         panel.Controls.Add(_onlyAcrossFoldersCheckBox);
-        panel.Controls.Add(patternLabel);
-        panel.Controls.Add(_patternTextBox);
+        panel.Controls.Add(fileNamePatternLabel);
+        panel.Controls.Add(_fileNamePatternTextBox);
+        panel.Controls.Add(folderNamePatternLabel);
+        panel.Controls.Add(_folderNamePatternTextBox);
         panel.Controls.Add(minimumSizeLabel);
         panel.Controls.Add(_minimumSizeBox);
         panel.Controls.Add(_scanButton);
@@ -251,7 +268,7 @@ public sealed class MainForm : Form
             HeaderText = headerText,
             MinimumWidth = width,
             FillWeight = fillWeight,
-            SortMode = DataGridViewColumnSortMode.NotSortable
+            SortMode = DataGridViewColumnSortMode.Programmatic
         };
     }
 
@@ -330,6 +347,7 @@ public sealed class MainForm : Form
         _folderListBox.SelectedIndexChanged += (_, _) => UpdateActionButtons();
         _resultsGrid.SelectionChanged += (_, _) => UpdateActionButtons();
         _resultsGrid.RowPrePaint += ResultsGrid_RowPrePaint;
+        _resultsGrid.ColumnHeaderMouseClick += ResultsGrid_ColumnHeaderMouseClick;
     }
 
     private void AddFolderButton_Click(object? sender, EventArgs e)
@@ -393,7 +411,8 @@ public sealed class MainForm : Form
             _includeHiddenCheckBox.Checked,
             _lastOnlyAcrossFolders,
             Decimal.ToInt64(_minimumSizeBox.Value) * 1024L,
-            ParsePatterns(_patternTextBox.Text));
+            ParsePatterns(_fileNamePatternTextBox.Text),
+            ParsePatterns(_folderNamePatternTextBox.Text));
 
         _scanCancellation = new CancellationTokenSource();
         var cancellationToken = _scanCancellation.Token;
@@ -608,6 +627,62 @@ public sealed class MainForm : Form
         style.SelectionForeColor = Color.White;
     }
 
+    private void ResultsGrid_ColumnHeaderMouseClick(object? sender, DataGridViewCellMouseEventArgs e)
+    {
+        if (e.ColumnIndex < 0 || _resultsGrid.Columns[e.ColumnIndex] is not DataGridViewColumn column)
+        {
+            return;
+        }
+
+        var propertyName = column.DataPropertyName;
+        _sortDirection = string.Equals(_sortPropertyName, propertyName, StringComparison.Ordinal)
+            ? (_sortDirection == ListSortDirection.Ascending ? ListSortDirection.Descending : ListSortDirection.Ascending)
+            : ListSortDirection.Ascending;
+        _sortPropertyName = propertyName;
+
+        ApplyResultSort();
+
+        foreach (DataGridViewColumn gridColumn in _resultsGrid.Columns)
+        {
+            gridColumn.HeaderCell.SortGlyphDirection = gridColumn == column
+                ? (_sortDirection == ListSortDirection.Ascending ? SortOrder.Ascending : SortOrder.Descending)
+                : SortOrder.None;
+        }
+    }
+
+    private void ApplyResultSort()
+    {
+        IEnumerable<DuplicateFileRow> sortedRows = _sortPropertyName switch
+        {
+            nameof(DuplicateFileRow.GroupNumber) => _rows.OrderBy(row => row.GroupNumber),
+            nameof(DuplicateFileRow.TargetFolder) => _rows.OrderBy(row => row.TargetFolder, StringComparer.CurrentCultureIgnoreCase),
+            nameof(DuplicateFileRow.FileName) => _rows.OrderBy(row => row.FileName, StringComparer.CurrentCultureIgnoreCase),
+            nameof(DuplicateFileRow.Folder) => _rows.OrderBy(row => row.Folder, StringComparer.CurrentCultureIgnoreCase),
+            nameof(DuplicateFileRow.SizeText) => _rows.OrderBy(row => row.File.Size),
+            nameof(DuplicateFileRow.LastWriteLocalText) => _rows.OrderBy(row => row.File.LastWriteTimeUtc),
+            nameof(DuplicateFileRow.Sha256) => _rows.OrderBy(row => row.Sha256, StringComparer.OrdinalIgnoreCase),
+            _ => _rows.OrderBy(row => row.GroupNumber).ThenBy(row => row.File.FullPath, StringComparer.OrdinalIgnoreCase)
+        };
+
+        var snapshot = (_sortDirection == ListSortDirection.Descending ? sortedRows.Reverse() : sortedRows).ToArray();
+        _rows.RaiseListChangedEvents = false;
+        try
+        {
+            _rows.Clear();
+            foreach (var row in snapshot)
+            {
+                _rows.Add(row);
+            }
+        }
+        finally
+        {
+            _rows.RaiseListChangedEvents = true;
+            _rows.ResetBindings();
+        }
+
+        _resultsGrid.ClearSelection();
+    }
+
     private void AddFolder(string folderPath)
     {
         var normalized = NormalizeFolderPath(folderPath);
@@ -632,6 +707,11 @@ public sealed class MainForm : Form
             {
                 _rows.Add(new DuplicateFileRow(group.Number, file));
             }
+        }
+
+        if (_sortPropertyName is not null)
+        {
+            ApplyResultSort();
         }
 
         _resultsGrid.ClearSelection();
@@ -689,7 +769,8 @@ public sealed class MainForm : Form
         _recursiveCheckBox.Enabled = !isScanning;
         _includeHiddenCheckBox.Enabled = !isScanning;
         _onlyAcrossFoldersCheckBox.Enabled = !isScanning;
-        _patternTextBox.Enabled = !isScanning;
+        _fileNamePatternTextBox.Enabled = !isScanning;
+        _folderNamePatternTextBox.Enabled = !isScanning;
         _minimumSizeBox.Enabled = !isScanning;
         _cancelButton.Enabled = isScanning;
 
