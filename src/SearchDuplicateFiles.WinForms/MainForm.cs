@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Diagnostics;
+using System.IO.Enumeration;
 using System.Text;
 using Microsoft.VisualBasic.FileIO;
 
@@ -50,6 +51,7 @@ public sealed class MainForm : Form
     private bool _isScanning;
     private bool _lastOnlyAcrossFolders;
     private int _lastScannedFolderCount;
+    private DuplicateScanResult? _lastScanResult;
     private string? _sortPropertyName;
     private ListSortDirection _sortDirection = ListSortDirection.Ascending;
 
@@ -185,7 +187,7 @@ public sealed class MainForm : Form
         _fileNamePatternTextBox.Text = "*";
         _fileNamePatternTextBox.Width = 130;
         _fileNamePatternTextBox.Margin = new Padding(0, 3, 16, 0);
-        _toolTip.SetToolTip(_fileNamePatternTextBox, "*.jpg;*.png のように ; 区切りで指定できます。");
+        _toolTip.SetToolTip(_fileNamePatternTextBox, "文字だけなら部分一致、*.jpg のように * と ? も使用できます。複数条件は ; 区切りです。");
 
         var folderNamePatternLabel = new Label
         {
@@ -197,7 +199,7 @@ public sealed class MainForm : Form
         _folderNamePatternTextBox.Text = "*";
         _folderNamePatternTextBox.Width = 130;
         _folderNamePatternTextBox.Margin = new Padding(0, 3, 16, 0);
-        _toolTip.SetToolTip(_folderNamePatternTextBox, "ファイルの親フォルダー名を temp*;backup のように ; 区切りで指定できます。");
+        _toolTip.SetToolTip(_folderNamePatternTextBox, "ファイルの親フォルダー名を部分一致またはワイルドカードで指定できます。複数条件は ; 区切りです。");
 
         var minimumSizeLabel = new Label
         {
@@ -348,6 +350,8 @@ public sealed class MainForm : Form
         _resultsGrid.SelectionChanged += (_, _) => UpdateActionButtons();
         _resultsGrid.RowPrePaint += ResultsGrid_RowPrePaint;
         _resultsGrid.ColumnHeaderMouseClick += ResultsGrid_ColumnHeaderMouseClick;
+        _fileNamePatternTextBox.TextChanged += (_, _) => ApplyFiltersToLastResult();
+        _folderNamePatternTextBox.TextChanged += (_, _) => ApplyFiltersToLastResult();
     }
 
     private void AddFolderButton_Click(object? sender, EventArgs e)
@@ -410,13 +414,12 @@ public sealed class MainForm : Form
             _recursiveCheckBox.Checked,
             _includeHiddenCheckBox.Checked,
             _lastOnlyAcrossFolders,
-            Decimal.ToInt64(_minimumSizeBox.Value) * 1024L,
-            ParsePatterns(_fileNamePatternTextBox.Text),
-            ParsePatterns(_folderNamePatternTextBox.Text));
+            Decimal.ToInt64(_minimumSizeBox.Value) * 1024L);
 
         _scanCancellation = new CancellationTokenSource();
         var cancellationToken = _scanCancellation.Token;
         _lastWarnings = Array.Empty<string>();
+        _lastScanResult = null;
         _rows.Clear();
         _statusLabel.Text = "スキャン準備中...";
         Text = $"{AppTitle} - スキャン準備中";
@@ -579,14 +582,7 @@ public sealed class MainForm : Form
 
         if (removedPaths.Count > 0)
         {
-            var remainingRows = RebuildRowsAfterRemoval(removedPaths);
-            _rows.Clear();
-            foreach (var row in remainingRows)
-            {
-                _rows.Add(row);
-            }
-
-            _resultsGrid.ClearSelection();
+            RemoveFilesFromLastResult(removedPaths);
             _statusLabel.Text = $"{removedPaths.Count:N0} 件をごみ箱へ移動しました。";
         }
 
@@ -698,10 +694,28 @@ public sealed class MainForm : Form
 
     private void LoadResult(DuplicateScanResult result)
     {
+        _lastScanResult = result;
         _lastWarnings = result.Warnings;
+        ApplyFiltersToLastResult();
+        Text = $"{AppTitle} - 完了";
+    }
+
+    private void ApplyFiltersToLastResult()
+    {
+        if (_lastScanResult is null || _isScanning)
+        {
+            return;
+        }
+
+        var fileNamePatterns = ParsePatterns(_fileNamePatternTextBox.Text);
+        var folderNamePatterns = ParsePatterns(_folderNamePatternTextBox.Text);
+        var visibleGroups = _lastScanResult.Groups
+            .Where(group => GroupMatchesPatterns(group, fileNamePatterns, folderNamePatterns))
+            .ToArray();
+
         _rows.Clear();
 
-        foreach (var group in result.Groups)
+        foreach (var group in visibleGroups)
         {
             foreach (var file in group.Files)
             {
@@ -716,8 +730,7 @@ public sealed class MainForm : Form
 
         _resultsGrid.ClearSelection();
         _resultsGrid.Refresh();
-        _statusLabel.Text = CreateSummaryText(result);
-        Text = $"{AppTitle} - 完了";
+        _statusLabel.Text = CreateSummaryText(_lastScanResult, visibleGroups);
         UpdateActionButtons();
     }
 
@@ -838,33 +851,38 @@ public sealed class MainForm : Form
             .ThenBy(row => row.File.FullPath, StringComparer.OrdinalIgnoreCase);
     }
 
-    private List<DuplicateFileRow> RebuildRowsAfterRemoval(HashSet<string> removedPaths)
+    private void RemoveFilesFromLastResult(HashSet<string> removedPaths)
     {
-        return _rows
-            .Where(row => !removedPaths.Contains(row.File.FullPath))
-            .GroupBy(row => (row.File.Size, row.File.Sha256))
-            .Where(group => IsVisibleDuplicateGroup(group.Select(row => row.File), _lastOnlyAcrossFolders))
-            .OrderByDescending(group => (group.Count() - 1) * group.Key.Size)
-            .ThenByDescending(group => group.Key.Size)
-            .SelectMany((group, index) => group
-                .OrderBy(row => row.File.RootPath, StringComparer.OrdinalIgnoreCase)
-                .ThenBy(row => row.File.FullPath, StringComparer.OrdinalIgnoreCase)
-                .Select(row => new DuplicateFileRow(index + 1, row.File)))
-            .ToList();
+        if (_lastScanResult is null)
+        {
+            return;
+        }
+
+        var groups = _lastScanResult.Groups
+            .Select(group => group.Files.Where(file => !removedPaths.Contains(file.FullPath)).ToArray())
+            .Where(files => IsVisibleDuplicateGroup(files, _lastOnlyAcrossFolders))
+            .Select((files, index) => new DuplicateFileGroup(index + 1, files[0].Size, files[0].Sha256, files))
+            .ToArray();
+
+        _lastScanResult = _lastScanResult with { Groups = groups };
+        ApplyFiltersToLastResult();
     }
 
-    private string CreateSummaryText(DuplicateScanResult result)
+    private string CreateSummaryText(DuplicateScanResult result, IReadOnlyList<DuplicateFileGroup> visibleGroups)
     {
         var warningText = result.Warnings.Count == 0 ? string.Empty : $" / 警告 {result.Warnings.Count:N0} 件";
         var comparisonText = _lastOnlyAcrossFolders ? " / フォルダー間のみ" : string.Empty;
         var targetText = $"対象 {_lastScannedFolderCount:N0} フォルダー{comparisonText}";
+        var duplicateFileCount = visibleGroups.Sum(group => group.Files.Count);
+        var reclaimableBytes = visibleGroups.Sum(group => (group.Files.Count - 1) * group.Size);
+        var filterText = visibleGroups.Count == result.Groups.Count ? string.Empty : $" / 絞り込み {visibleGroups.Count:N0}/{result.Groups.Count:N0} グループ";
 
-        if (result.Groups.Count == 0)
+        if (visibleGroups.Count == 0)
         {
-            return $"完了: 重複は見つかりませんでした。{targetText} / 確認 {result.TotalFilesSeen:N0} 件 / ハッシュ {result.FilesHashed:N0} 件 / {result.Elapsed:mm\\:ss}{warningText}";
+            return $"完了: 条件に一致する重複はありません。{targetText}{filterText} / 確認 {result.TotalFilesSeen:N0} 件 / ハッシュ {result.FilesHashed:N0} 件 / {result.Elapsed:mm\\:ss}{warningText}";
         }
 
-        return $"完了: {result.Groups.Count:N0} グループ / 重複候補 {result.DuplicateFileCount:N0} 件 / 削減可能 {FormatSize(result.ReclaimableBytes)} / {targetText} / {result.Elapsed:mm\\:ss}{warningText}";
+        return $"完了: {visibleGroups.Count:N0} グループ / 重複候補 {duplicateFileCount:N0} 件 / 削減可能 {FormatSize(reclaimableBytes)}{filterText} / {targetText} / {result.Elapsed:mm\\:ss}{warningText}";
     }
 
     private static IReadOnlyList<string> ParsePatterns(string input)
@@ -875,6 +893,29 @@ public sealed class MainForm : Form
             .ToArray();
 
         return patterns.Length == 0 ? new[] { "*" } : patterns;
+    }
+
+    private static bool GroupMatchesPatterns(
+        DuplicateFileGroup group,
+        IReadOnlyList<string> fileNamePatterns,
+        IReadOnlyList<string> folderNamePatterns)
+    {
+        var matchesFileName = fileNamePatterns.Any(pattern => group.Files.Any(file => MatchesName(Path.GetFileName(file.FullPath), pattern)));
+        var matchesFolderName = folderNamePatterns.Any(pattern => group.Files.Any(file =>
+        {
+            var directory = Path.GetDirectoryName(file.FullPath) ?? string.Empty;
+            var folderName = Path.GetFileName(Path.TrimEndingDirectorySeparator(directory));
+            return MatchesName(folderName, pattern);
+        }));
+
+        return matchesFileName && matchesFolderName;
+    }
+
+    private static bool MatchesName(string name, string pattern)
+    {
+        return pattern.IndexOfAny(['*', '?']) >= 0
+            ? FileSystemName.MatchesSimpleExpression(pattern, name, ignoreCase: true)
+            : name.Contains(pattern, StringComparison.CurrentCultureIgnoreCase);
     }
 
     private static string NormalizeFolderPath(string folderPath)

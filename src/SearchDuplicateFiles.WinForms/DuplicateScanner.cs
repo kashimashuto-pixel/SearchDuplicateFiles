@@ -1,5 +1,4 @@
 using System.Diagnostics;
-using System.IO.Enumeration;
 using System.Security.Cryptography;
 
 namespace SearchDuplicateFiles.WinForms;
@@ -9,9 +8,7 @@ public sealed record ScanOptions(
     bool IncludeSubdirectories,
     bool IncludeHiddenAndSystemFiles,
     bool OnlyShowAcrossDifferentRootFolders,
-    long MinimumSizeBytes,
-    IReadOnlyList<string> FileNamePatterns,
-    IReadOnlyList<string> FolderNamePatterns);
+    long MinimumSizeBytes);
 
 public sealed record DuplicateFile(
     string FullPath,
@@ -80,7 +77,6 @@ public sealed class DuplicateScanner
         var filesBySize = new Dictionary<long, List<FileCandidate>>();
         var seenPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var filesSeen = 0;
-        var folderNamePatterns = NormalizePatterns(options.FolderNamePatterns).ToArray();
 
         void ReportProgress(ScanProgress scanProgress, bool force = false)
         {
@@ -100,11 +96,8 @@ public sealed class DuplicateScanner
 
         foreach (var rootPath in rootPaths)
         {
-            foreach (var pattern in NormalizePatterns(options.FileNamePatterns))
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                EnumerateFiles(rootPath, options, pattern, folderNamePatterns, seenPaths, filesBySize, warnings, ReportProgress, ref filesSeen, cancellationToken);
-            }
+            cancellationToken.ThrowIfCancellationRequested();
+            EnumerateFiles(rootPath, options, "*", seenPaths, filesBySize, warnings, ReportProgress, ref filesSeen, cancellationToken);
         }
 
         var candidateFiles = filesBySize
@@ -196,7 +189,6 @@ public sealed class DuplicateScanner
         string rootPath,
         ScanOptions options,
         string pattern,
-        IReadOnlyList<string> folderNamePatterns,
         HashSet<string> seenPaths,
         Dictionary<long, List<FileCandidate>> filesBySize,
         List<string> warnings,
@@ -221,11 +213,6 @@ public sealed class DuplicateScanner
             foreach (var path in files)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-
-                if (!MatchesFolderName(path, folderNamePatterns))
-                {
-                    continue;
-                }
 
                 if (!seenPaths.Add(path))
                 {
@@ -305,27 +292,6 @@ public sealed class DuplicateScanner
             .Where(Directory.Exists)
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToArray();
-    }
-
-    private static IEnumerable<string> NormalizePatterns(IReadOnlyList<string> patterns)
-    {
-        var normalized = patterns
-            .Where(pattern => !string.IsNullOrWhiteSpace(pattern))
-            .Select(pattern => pattern.Trim())
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToArray();
-
-        return normalized.Length == 0 ? new[] { "*" } : normalized;
-    }
-
-    private static bool MatchesFolderName(string filePath, IReadOnlyList<string> patterns)
-    {
-        var directoryPath = Path.GetDirectoryName(filePath);
-        var folderName = string.IsNullOrEmpty(directoryPath)
-            ? string.Empty
-            : Path.GetFileName(Path.TrimEndingDirectorySeparator(directoryPath));
-
-        return patterns.Any(pattern => FileSystemName.MatchesSimpleExpression(pattern, folderName, ignoreCase: true));
     }
 
     private static bool IsDuplicateGroup(IReadOnlyList<DuplicateFile> files, bool onlyShowAcrossDifferentRootFolders)
