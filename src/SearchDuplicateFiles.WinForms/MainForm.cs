@@ -34,6 +34,7 @@ public sealed class MainForm : Form
     private readonly Button _clearFoldersButton = new();
     private readonly Button _scanButton = new();
     private readonly Button _cancelButton = new();
+    private readonly Button _applyFilterButton = new();
     private readonly Button _exportButton = new();
     private readonly Button _openFileButton = new();
     private readonly Button _openFolderButton = new();
@@ -201,6 +202,10 @@ public sealed class MainForm : Form
         _folderNamePatternTextBox.Margin = new Padding(0, 3, 16, 0);
         _toolTip.SetToolTip(_folderNamePatternTextBox, "ファイルの親フォルダー名を部分一致またはワイルドカードで指定できます。複数条件は ; 区切りです。");
 
+        _applyFilterButton.Text = "フィルター適用";
+        _applyFilterButton.AutoSize = true;
+        _applyFilterButton.Margin = new Padding(0, 0, 16, 0);
+
         var minimumSizeLabel = new Label
         {
             Text = "最小サイズ(KB)",
@@ -228,6 +233,7 @@ public sealed class MainForm : Form
         panel.Controls.Add(_fileNamePatternTextBox);
         panel.Controls.Add(folderNamePatternLabel);
         panel.Controls.Add(_folderNamePatternTextBox);
+        panel.Controls.Add(_applyFilterButton);
         panel.Controls.Add(minimumSizeLabel);
         panel.Controls.Add(_minimumSizeBox);
         panel.Controls.Add(_scanButton);
@@ -341,6 +347,7 @@ public sealed class MainForm : Form
         _clearFoldersButton.Click += ClearFoldersButton_Click;
         _scanButton.Click += ScanButton_Click;
         _cancelButton.Click += CancelButton_Click;
+        _applyFilterButton.Click += (_, _) => ApplyFiltersToLastResult();
         _exportButton.Click += ExportButton_Click;
         _openFileButton.Click += OpenFileButton_Click;
         _openFolderButton.Click += OpenFolderButton_Click;
@@ -350,8 +357,6 @@ public sealed class MainForm : Form
         _resultsGrid.SelectionChanged += (_, _) => UpdateActionButtons();
         _resultsGrid.RowPrePaint += ResultsGrid_RowPrePaint;
         _resultsGrid.ColumnHeaderMouseClick += ResultsGrid_ColumnHeaderMouseClick;
-        _fileNamePatternTextBox.TextChanged += (_, _) => ApplyFiltersToLastResult();
-        _folderNamePatternTextBox.TextChanged += (_, _) => ApplyFiltersToLastResult();
     }
 
     private void AddFolderButton_Click(object? sender, EventArgs e)
@@ -702,7 +707,7 @@ public sealed class MainForm : Form
 
     private void ApplyFiltersToLastResult()
     {
-        if (_lastScanResult is null || _isScanning)
+        if (_lastScanResult is null)
         {
             return;
         }
@@ -784,6 +789,7 @@ public sealed class MainForm : Form
         _onlyAcrossFoldersCheckBox.Enabled = !isScanning;
         _fileNamePatternTextBox.Enabled = !isScanning;
         _folderNamePatternTextBox.Enabled = !isScanning;
+        _applyFilterButton.Enabled = !isScanning && _lastScanResult is not null;
         _minimumSizeBox.Enabled = !isScanning;
         _cancelButton.Enabled = isScanning;
 
@@ -823,6 +829,7 @@ public sealed class MainForm : Form
         _removeFolderButton.Enabled = !_isScanning && hasFolderSelection;
         _clearFoldersButton.Enabled = !_isScanning && hasFolders;
         _scanButton.Enabled = !_isScanning && hasFolders;
+        _applyFilterButton.Enabled = !_isScanning && _lastScanResult is not null;
         _onlyAcrossFoldersCheckBox.Enabled = !_isScanning && canCompareFolders;
         _exportButton.Enabled = !_isScanning && hasRows;
         _openFileButton.Enabled = !_isScanning && hasResultSelection;
