@@ -25,6 +25,7 @@ public sealed class MainForm : Form
     private readonly ListBox _folderListBox = new();
     private readonly TextBox _fileNamePatternTextBox = new();
     private readonly TextBox _folderNamePatternTextBox = new();
+    private readonly ComboBox _filterDisplayModeBox = new();
     private readonly NumericUpDown _minimumSizeBox = new();
     private readonly CheckBox _recursiveCheckBox = new();
     private readonly CheckBox _includeHiddenCheckBox = new();
@@ -202,6 +203,19 @@ public sealed class MainForm : Form
         _folderNamePatternTextBox.Margin = new Padding(0, 3, 16, 0);
         _toolTip.SetToolTip(_folderNamePatternTextBox, "ファイルの親フォルダー名を部分一致またはワイルドカードで指定できます。複数条件は ; 区切りです。");
 
+        var filterDisplayModeLabel = new Label
+        {
+            Text = "表示方法",
+            AutoSize = true,
+            Margin = new Padding(0, 7, 6, 0)
+        };
+
+        _filterDisplayModeBox.DropDownStyle = ComboBoxStyle.DropDownList;
+        _filterDisplayModeBox.Items.AddRange(["重複グループ全体", "条件に一致したファイルのみ"]);
+        _filterDisplayModeBox.SelectedIndex = 0;
+        _filterDisplayModeBox.Width = 180;
+        _filterDisplayModeBox.Margin = new Padding(0, 3, 16, 0);
+
         _applyFilterButton.Text = "フィルター適用";
         _applyFilterButton.AutoSize = true;
         _applyFilterButton.Margin = new Padding(0, 0, 16, 0);
@@ -233,6 +247,8 @@ public sealed class MainForm : Form
         panel.Controls.Add(_fileNamePatternTextBox);
         panel.Controls.Add(folderNamePatternLabel);
         panel.Controls.Add(_folderNamePatternTextBox);
+        panel.Controls.Add(filterDisplayModeLabel);
+        panel.Controls.Add(_filterDisplayModeBox);
         panel.Controls.Add(_applyFilterButton);
         panel.Controls.Add(minimumSizeLabel);
         panel.Controls.Add(_minimumSizeBox);
@@ -715,7 +731,22 @@ public sealed class MainForm : Form
         var fileNamePatterns = ParsePatterns(_fileNamePatternTextBox.Text);
         var folderNamePatterns = ParsePatterns(_folderNamePatternTextBox.Text);
         var visibleGroups = _lastScanResult.Groups
-            .Where(group => GroupMatchesPatterns(group, fileNamePatterns, folderNamePatterns))
+            .Select(group =>
+            {
+                var matchingFiles = group.Files
+                    .Where(file => FileMatchesPatterns(file, fileNamePatterns, folderNamePatterns))
+                    .ToArray();
+
+                if (matchingFiles.Length == 0)
+                {
+                    return null;
+                }
+
+                var displayedFiles = _filterDisplayModeBox.SelectedIndex == 1 ? matchingFiles : group.Files;
+                return new DuplicateFileGroup(group.Number, group.Size, group.Sha256, displayedFiles);
+            })
+            .Where(group => group is not null)
+            .Cast<DuplicateFileGroup>()
             .ToArray();
 
         _rows.Clear();
@@ -789,6 +820,7 @@ public sealed class MainForm : Form
         _onlyAcrossFoldersCheckBox.Enabled = !isScanning;
         _fileNamePatternTextBox.Enabled = !isScanning;
         _folderNamePatternTextBox.Enabled = !isScanning;
+        _filterDisplayModeBox.Enabled = !isScanning;
         _applyFilterButton.Enabled = !isScanning && _lastScanResult is not null;
         _minimumSizeBox.Enabled = !isScanning;
         _cancelButton.Enabled = isScanning;
@@ -902,18 +934,15 @@ public sealed class MainForm : Form
         return patterns.Length == 0 ? new[] { "*" } : patterns;
     }
 
-    private static bool GroupMatchesPatterns(
-        DuplicateFileGroup group,
+    private static bool FileMatchesPatterns(
+        DuplicateFile file,
         IReadOnlyList<string> fileNamePatterns,
         IReadOnlyList<string> folderNamePatterns)
     {
-        var matchesFileName = fileNamePatterns.Any(pattern => group.Files.Any(file => MatchesName(Path.GetFileName(file.FullPath), pattern)));
-        var matchesFolderName = folderNamePatterns.Any(pattern => group.Files.Any(file =>
-        {
-            var directory = Path.GetDirectoryName(file.FullPath) ?? string.Empty;
-            var folderName = Path.GetFileName(Path.TrimEndingDirectorySeparator(directory));
-            return MatchesName(folderName, pattern);
-        }));
+        var matchesFileName = fileNamePatterns.Any(pattern => MatchesName(Path.GetFileName(file.FullPath), pattern));
+        var directory = Path.GetDirectoryName(file.FullPath) ?? string.Empty;
+        var folderName = Path.GetFileName(Path.TrimEndingDirectorySeparator(directory));
+        var matchesFolderName = folderNamePatterns.Any(pattern => MatchesName(folderName, pattern));
 
         return matchesFileName && matchesFolderName;
     }
