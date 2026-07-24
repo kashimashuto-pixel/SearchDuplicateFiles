@@ -141,13 +141,13 @@ public sealed class MainForm : Form
         };
 
         _addFolderButton.Text = "フォルダー...";
-        _addArchiveButton.Text = "ZIP...";
+        _addArchiveButton.Text = "圧縮ファイル...";
         _removeFolderButton.Text = "削除";
         _clearFoldersButton.Text = "クリア";
 
         foreach (var button in new[] { _addFolderButton, _addArchiveButton, _removeFolderButton, _clearFoldersButton })
         {
-            button.Width = 90;
+            button.Width = 110;
             button.Margin = new Padding(0, 0, 0, 6);
             buttons.Controls.Add(button);
         }
@@ -180,7 +180,7 @@ public sealed class MainForm : Form
         _onlyAcrossFoldersCheckBox.Text = "異なる検索対象間の重複だけ表示";
         _onlyAcrossFoldersCheckBox.AutoSize = true;
         _onlyAcrossFoldersCheckBox.Margin = new Padding(0, 6, 16, 0);
-        _toolTip.SetToolTip(_onlyAcrossFoldersCheckBox, "フォルダーとZIPなど、2つ以上の検索対象にまたがる重複だけを表示します。");
+        _toolTip.SetToolTip(_onlyAcrossFoldersCheckBox, "フォルダーと圧縮ファイルなど、2つ以上の検索対象にまたがる重複だけを表示します。");
 
         var fileNamePatternLabel = new Label
         {
@@ -346,7 +346,7 @@ public sealed class MainForm : Form
         _progressBar.Height = 18;
         _progressBar.Margin = new Padding(0, 2, 10, 0);
 
-        _statusLabel.Text = "検索対象のフォルダーまたはZIPを追加してください。";
+        _statusLabel.Text = "検索対象のフォルダーまたは圧縮ファイルを追加してください。";
         _statusLabel.AutoEllipsis = true;
         _statusLabel.Dock = DockStyle.Fill;
         _statusLabel.TextAlign = ContentAlignment.MiddleLeft;
@@ -407,8 +407,8 @@ public sealed class MainForm : Form
         {
             CheckFileExists = true,
             Multiselect = true,
-            Filter = "ZIP アーカイブ (*.zip)|*.zip",
-            Title = "内容を比較するZIPアーカイブを選択",
+            Filter = "対応する圧縮ファイル|*.zip;*.7z;*.tar;*.tar.gz;*.tgz;*.tar.bz2;*.tbz2;*.tbz;*.tar.xz;*.txz;*.tar.lz;*.tar.lzip;*.tlz;*.tar.zst;*.tar.zstd;*.tzst|すべてのファイル (*.*)|*.*",
+            Title = "内容を比較する圧縮ファイルを選択",
             InitialDirectory = selectedPath is null
                 ? Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments)
                 : Path.GetDirectoryName(selectedPath)
@@ -446,7 +446,7 @@ public sealed class MainForm : Form
         var archivePaths = GetTargetArchives();
         if (rootPaths.Count == 0 && archivePaths.Count == 0)
         {
-            MessageBox.Show(this, "検索対象のフォルダーまたはZIPを1つ以上追加してください。", "検索対象の確認", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            MessageBox.Show(this, "検索対象のフォルダーまたは圧縮ファイルを1つ以上追加してください。", "検索対象の確認", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
 
@@ -612,8 +612,8 @@ public sealed class MainForm : Form
         {
             MessageBox.Show(
                 this,
-                "ZIP内のエントリは個別に削除できません。通常ファイルだけを選択してください。",
-                "ZIP内エントリ",
+                "圧縮ファイル内のエントリは個別に削除できません。通常ファイルだけを選択してください。",
+                "圧縮ファイル内エントリ",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Information);
             return;
@@ -767,6 +767,17 @@ public sealed class MainForm : Form
     private void AddArchive(string archivePath)
     {
         var normalized = Path.GetFullPath(archivePath.Trim());
+        if (!DuplicateScanner.IsSupportedArchivePath(normalized))
+        {
+            MessageBox.Show(
+                this,
+                $"対応していない圧縮形式です:{Environment.NewLine}{normalized}",
+                "圧縮形式の確認",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+            return;
+        }
+
         if (_folderListBox.Items.Cast<string>().Any(item => string.Equals(item, normalized, StringComparison.OrdinalIgnoreCase)))
         {
             return;
@@ -941,7 +952,7 @@ public sealed class MainForm : Form
     {
         return _folderListBox.Items
             .Cast<string>()
-            .Where(path => !string.Equals(Path.GetExtension(path), ".zip", StringComparison.OrdinalIgnoreCase))
+            .Where(path => !DuplicateScanner.IsSupportedArchivePath(path))
             .Select(NormalizeFolderPath)
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToArray();
@@ -951,7 +962,7 @@ public sealed class MainForm : Form
     {
         return _folderListBox.Items
             .Cast<string>()
-            .Where(path => string.Equals(Path.GetExtension(path), ".zip", StringComparison.OrdinalIgnoreCase))
+            .Where(DuplicateScanner.IsSupportedArchivePath)
             .Select(path => Path.GetFullPath(path.Trim()))
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToArray();
@@ -989,7 +1000,7 @@ public sealed class MainForm : Form
     {
         var warningText = result.Warnings.Count == 0 ? string.Empty : $" / 警告 {result.Warnings.Count:N0} 件";
         var comparisonText = _lastOnlyAcrossFolders ? " / 異なる対象間のみ" : string.Empty;
-        var targetText = $"対象: フォルダー {_lastScannedFolderCount:N0} / ZIP {_lastScannedArchiveCount:N0}{comparisonText}";
+        var targetText = $"対象: フォルダー {_lastScannedFolderCount:N0} / 圧縮 {_lastScannedArchiveCount:N0}{comparisonText}";
         var duplicateFileCount = visibleGroups.Sum(group => group.Files.Count);
         var reclaimableBytes = visibleGroups.Sum(group => (group.Files.Count - 1) * group.Size);
         var filterText = visibleGroups.Count == result.Groups.Count ? string.Empty : $" / 絞り込み {visibleGroups.Count:N0}/{result.Groups.Count:N0} グループ";

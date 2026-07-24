@@ -1,6 +1,9 @@
+using System.Buffers;
 using System.Diagnostics;
-using System.IO.Compression;
 using System.Security.Cryptography;
+using SharpCompress.Archives;
+using SharpCompress.Common;
+using SharpCompress.Readers;
 
 namespace SearchDuplicateFiles.WinForms;
 
@@ -64,6 +67,35 @@ public sealed class DuplicateScanner
 {
     private const int BufferSize = 1024 * 1024;
     private const int ProgressIntervalMilliseconds = 120;
+    private const int MaximumArchiveEntries = 250_000;
+    private const long MaximumArchiveEntrySizeBytes = 64L * 1024 * 1024 * 1024;
+    private const long MaximumArchiveTotalSizeBytes = 512L * 1024 * 1024 * 1024;
+
+    private static readonly string[] SupportedArchiveSuffixes =
+    [
+        ".tar.bz2",
+        ".tar.lzip",
+        ".tar.lz",
+        ".tar.xz",
+        ".tar.zst",
+        ".tar.zstd",
+        ".tar.gz",
+        ".tbz2",
+        ".tzst",
+        ".tgz",
+        ".tbz",
+        ".txz",
+        ".tlz",
+        ".zip",
+        ".7z",
+        ".tar"
+    ];
+
+    public static bool IsSupportedArchivePath(string path)
+    {
+        return !string.IsNullOrWhiteSpace(path)
+            && SupportedArchiveSuffixes.Any(suffix => path.EndsWith(suffix, StringComparison.OrdinalIgnoreCase));
+    }
 
     public async Task<DuplicateScanResult> ScanAsync(
         ScanOptions options,
@@ -76,7 +108,7 @@ public sealed class DuplicateScanner
         var archivePaths = NormalizeArchivePaths(options.ArchivePaths).ToArray();
         if (rootPaths.Length == 0 && archivePaths.Length == 0)
         {
-            throw new ArgumentException("At least one folder or ZIP archive is required.", nameof(options));
+            throw new ArgumentException("At least one folder or supported archive is required.", nameof(options));
         }
 
         var stopwatch = Stopwatch.StartNew();
@@ -124,61 +156,82 @@ public sealed class DuplicateScanner
         ReportProgress(new ScanProgress(ScanStage.Hashing, filesSeen, candidateFiles.Count, 0, 0, null), force: true);
 
         var hashedFiles = new Dictionary<string, List<DuplicateFile>>(StringComparer.OrdinalIgnoreCase);
-        var openArchives = new Dictionary<string, ZipArchive>(StringComparer.OrdinalIgnoreCase);
         var filesHashed = 0;
 
-        try
+        void AddHashedFile(DuplicateFile duplicateFile)
         {
-            foreach (var candidate in candidateFiles)
+            var key = $"{duplicateFile.Size}:{duplicateFile.Sha256}";
+            if (!hashedFiles.TryGetValue(key, out var list))
             {
-                cancellationToken.ThrowIfCancellationRequested();
-                ReportProgress(new ScanProgress(
-                    ScanStage.Hashing,
-                    filesSeen,
-                    candidateFiles.Count,
-                    filesHashed,
-                    0,
-                    candidate.DisplayPath));
+                list = new List<DuplicateFile>();
+                hashedFiles[key] = list;
+            }
 
-                DuplicateFile? duplicateFile;
-                try
-                {
-                    duplicateFile = candidate.IsArchiveEntry
-                        ? await HashArchiveEntryAsync(candidate, openArchives, cancellationToken).ConfigureAwait(false)
-                        : await HashFileAsync(candidate, cancellationToken).ConfigureAwait(false);
-                }
-                catch (OperationCanceledException)
-                {
-                    throw;
-                }
-                catch (Exception ex) when (IsExpectedFileException(ex))
-                {
-                    warnings.Add($"スキップ: 読み取りできませんでした: {candidate.DisplayPath} ({ex.Message})");
-                    continue;
-                }
+            list.Add(duplicateFile);
+            filesHashed++;
+        }
 
+        foreach (var candidate in candidateFiles.Where(candidate => !candidate.IsArchiveEntry))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            ReportProgress(new ScanProgress(
+                ScanStage.Hashing,
+                filesSeen,
+                candidateFiles.Count,
+                filesHashed,
+                0,
+                candidate.DisplayPath));
+
+            try
+            {
+                var duplicateFile = await HashFileAsync(candidate, cancellationToken).ConfigureAwait(false);
                 if (duplicateFile is null)
                 {
                     warnings.Add($"スキップ: スキャン中に見つからないかサイズが変わりました: {candidate.DisplayPath}");
                     continue;
                 }
 
-                var key = $"{duplicateFile.Size}:{duplicateFile.Sha256}";
-                if (!hashedFiles.TryGetValue(key, out var list))
-                {
-                    list = new List<DuplicateFile>();
-                    hashedFiles[key] = list;
-                }
-
-                list.Add(duplicateFile);
-                filesHashed++;
+                AddHashedFile(duplicateFile);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex) when (IsExpectedFileException(ex))
+            {
+                warnings.Add($"スキップ: 読み取りできませんでした: {candidate.DisplayPath} ({ex.Message})");
             }
         }
-        finally
+
+        foreach (var archiveGroup in candidateFiles
+            .Where(candidate => candidate.IsArchiveEntry)
+            .GroupBy(candidate => candidate.ArchivePath!, StringComparer.OrdinalIgnoreCase))
         {
-            foreach (var archive in openArchives.Values)
+            cancellationToken.ThrowIfCancellationRequested();
+
+            try
             {
-                archive.Dispose();
+                HashArchiveCandidates(
+                    archiveGroup.Key,
+                    archiveGroup.ToArray(),
+                    warnings,
+                    candidate => ReportProgress(new ScanProgress(
+                        ScanStage.Hashing,
+                        filesSeen,
+                        candidateFiles.Count,
+                        filesHashed,
+                        0,
+                        candidate.DisplayPath)),
+                    AddHashedFile,
+                    cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex) when (IsExpectedFileException(ex))
+            {
+                warnings.Add($"圧縮ファイルの内容を確認できませんでした: {archiveGroup.Key} ({ex.Message})");
             }
         }
 
@@ -276,22 +329,60 @@ public sealed class DuplicateScanner
     {
         try
         {
-            using var archive = ZipFile.OpenRead(archivePath);
-            for (var index = 0; index < archive.Entries.Count; index++)
+            using var session = OpenArchiveReader(archivePath);
+            var entryIndex = -1;
+            var entryCount = 0;
+            long totalSize = 0;
+
+            while (session.Reader.MoveToNextEntry())
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                var entry = archive.Entries[index];
+                entryIndex++;
+                entryCount++;
 
-                if (string.IsNullOrEmpty(entry.Name))
+                if (entryCount > MaximumArchiveEntries)
+                {
+                    warnings.Add($"圧縮ファイルのエントリ数が上限 {MaximumArchiveEntries:N0} 件を超えたため、残りをスキップしました: {archivePath}");
+                    break;
+                }
+
+                var entry = session.Reader.Entry;
+                if (entry.IsDirectory || !string.IsNullOrWhiteSpace(entry.LinkTarget))
                 {
                     continue;
                 }
 
+                var entryPath = NormalizeArchiveEntryPath(entry.Key, entryIndex);
                 filesSeen++;
-                var displayPath = CreateArchiveDisplayPath(archivePath, entry.FullName);
+                var displayPath = CreateArchiveDisplayPath(archivePath, entryPath);
                 reportProgress(new ScanProgress(ScanStage.Enumerating, filesSeen, 0, 0, 0, displayPath), false);
 
-                if (entry.Length < options.MinimumSizeBytes || ShouldSkipArchiveEntry(entry, options))
+                if (entry.IsEncrypted)
+                {
+                    warnings.Add($"スキップ: 暗号化されたエントリには対応していません: {displayPath}");
+                    continue;
+                }
+
+                if (entry.Size < 0)
+                {
+                    warnings.Add($"スキップ: サイズを取得できませんでした: {displayPath}");
+                    continue;
+                }
+
+                if (entry.Size > MaximumArchiveEntrySizeBytes)
+                {
+                    warnings.Add($"展開後サイズが安全上限 {FormatSize(MaximumArchiveEntrySizeBytes)} を超えたため、この圧縮ファイルの残りをスキップしました: {displayPath}");
+                    break;
+                }
+
+                if (totalSize > MaximumArchiveTotalSizeBytes - entry.Size)
+                {
+                    warnings.Add($"圧縮ファイルの展開後合計サイズが安全上限 {FormatSize(MaximumArchiveTotalSizeBytes)} を超えたため、残りをスキップしました: {archivePath}");
+                    break;
+                }
+
+                totalSize += entry.Size;
+                if (entry.Size < options.MinimumSizeBytes || ShouldSkipArchiveEntry(entry, archivePath, options))
                 {
                     continue;
                 }
@@ -299,27 +390,129 @@ public sealed class DuplicateScanner
                 AddCandidate(filesBySize, new FileCandidate(
                     displayPath,
                     archivePath,
-                    entry.Length,
-                    entry.LastWriteTime.UtcDateTime,
+                    entry.Size,
+                    (entry.LastModifiedTime ?? File.GetLastWriteTimeUtc(archivePath)).ToUniversalTime(),
                     archivePath,
-                    entry.FullName,
-                    index));
+                    entryPath,
+                    entryIndex));
             }
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
         }
         catch (Exception ex) when (IsExpectedFileException(ex))
         {
-            warnings.Add($"ZIPを読み取りできませんでした: {archivePath} ({ex.Message})");
+            warnings.Add($"圧縮ファイルを読み取りできませんでした: {archivePath} ({ex.Message})");
         }
     }
 
-    private static bool ShouldSkipArchiveEntry(ZipArchiveEntry entry, ScanOptions options)
+    private static void HashArchiveCandidates(
+        string archivePath,
+        IReadOnlyList<FileCandidate> candidates,
+        List<string> warnings,
+        Action<FileCandidate> reportCandidate,
+        Action<DuplicateFile> addHashedFile,
+        CancellationToken cancellationToken)
+    {
+        var candidatesByIndex = candidates.ToDictionary(candidate => candidate.ArchiveEntryIndex);
+        var remainingIndices = candidatesByIndex.Keys.ToHashSet();
+
+        using var session = OpenArchiveReader(archivePath);
+        var entryIndex = -1;
+
+        while (remainingIndices.Count > 0 && session.Reader.MoveToNextEntry())
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            entryIndex++;
+
+            if (!candidatesByIndex.TryGetValue(entryIndex, out var candidate))
+            {
+                continue;
+            }
+
+            remainingIndices.Remove(entryIndex);
+            reportCandidate(candidate);
+
+            var entry = session.Reader.Entry;
+            var entryPath = NormalizeArchiveEntryPath(entry.Key, entryIndex);
+            if (entry.IsDirectory
+                || entry.IsEncrypted
+                || entry.Size != candidate.Size
+                || !string.Equals(entryPath, candidate.ArchiveEntryPath, StringComparison.Ordinal))
+            {
+                warnings.Add($"スキップ: スキャン中に圧縮ファイルの内容が変わりました: {candidate.DisplayPath}");
+                continue;
+            }
+
+            using var stream = session.Reader.OpenEntryStream();
+            var hash = ComputeSha256(stream, candidate.Size, cancellationToken);
+            addHashedFile(new DuplicateFile(
+                candidate.DisplayPath,
+                candidate.RootPath,
+                candidate.Size,
+                candidate.LastWriteTimeUtc,
+                hash,
+                candidate.ArchivePath,
+                candidate.ArchiveEntryPath));
+        }
+
+        foreach (var missingIndex in remainingIndices)
+        {
+            warnings.Add($"スキップ: 圧縮ファイル内のエントリが見つかりませんでした: {candidatesByIndex[missingIndex].DisplayPath}");
+        }
+    }
+
+    private static ArchiveReaderSession OpenArchiveReader(string archivePath)
+    {
+        var stream = new FileStream(
+            archivePath,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.Read,
+            BufferSize,
+            FileOptions.SequentialScan);
+
+        try
+        {
+            var options = ReaderOptions.ForExternalStream.WithExtensionHint(Path.GetFileName(archivePath));
+            if (archivePath.EndsWith(".7z", StringComparison.OrdinalIgnoreCase))
+            {
+                var archive = ArchiveFactory.OpenArchive(stream, options);
+                return new ArchiveReaderSession(archive.ExtractAllEntries(), archive, stream);
+            }
+
+            return new ArchiveReaderSession(ReaderFactory.OpenReader(stream, options), stream);
+        }
+        catch
+        {
+            stream.Dispose();
+            throw;
+        }
+    }
+
+    private static bool ShouldSkipArchiveEntry(IEntry entry, string archivePath, ScanOptions options)
     {
         if (options.IncludeHiddenAndSystemFiles)
         {
             return false;
         }
 
-        var attributes = (FileAttributes)(entry.ExternalAttributes & 0xffff);
+        var pathSegments = (entry.Key ?? string.Empty)
+            .Replace('\\', '/')
+            .Split('/', StringSplitOptions.RemoveEmptyEntries);
+        if (pathSegments.Any(segment => segment.StartsWith(".", StringComparison.Ordinal) && segment.Length > 1))
+        {
+            return true;
+        }
+
+        if (!archivePath.EndsWith(".zip", StringComparison.OrdinalIgnoreCase)
+            && !archivePath.EndsWith(".7z", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var attributes = (FileAttributes)(entry.Attrib ?? 0);
         return (attributes & (FileAttributes.Hidden | FileAttributes.System)) != 0;
     }
 
@@ -368,54 +561,46 @@ public sealed class DuplicateScanner
             BufferSize,
             FileOptions.Asynchronous | FileOptions.SequentialScan);
 
-        var hash = await ComputeSha256Async(stream, cancellationToken).ConfigureAwait(false);
+        var hash = await SHA256.HashDataAsync(stream, cancellationToken).ConfigureAwait(false);
         return new DuplicateFile(
             candidate.FullPath,
             candidate.RootPath,
             currentInfo.Length,
             currentInfo.LastWriteTimeUtc,
-            hash);
+            Convert.ToHexString(hash));
     }
 
-    private static async Task<DuplicateFile?> HashArchiveEntryAsync(
-        FileCandidate candidate,
-        Dictionary<string, ZipArchive> openArchives,
-        CancellationToken cancellationToken)
+    private static string ComputeSha256(Stream stream, long expectedSize, CancellationToken cancellationToken)
     {
-        if (!openArchives.TryGetValue(candidate.ArchivePath!, out var archive))
+        var buffer = ArrayPool<byte>.Shared.Rent(BufferSize);
+        try
         {
-            archive = ZipFile.OpenRead(candidate.ArchivePath!);
-            openArchives[candidate.ArchivePath!] = archive;
-        }
+            using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+            long totalBytesRead = 0;
+            int bytesRead;
+            while ((bytesRead = stream.Read(buffer, 0, buffer.Length)) > 0)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                totalBytesRead += bytesRead;
+                if (totalBytesRead > expectedSize)
+                {
+                    throw new InvalidDataException("エントリの実データが記録されたサイズを超えています。");
+                }
 
-        if (candidate.ArchiveEntryIndex < 0 || candidate.ArchiveEntryIndex >= archive.Entries.Count)
+                hash.AppendData(buffer, 0, bytesRead);
+            }
+
+            if (totalBytesRead != expectedSize)
+            {
+                throw new InvalidDataException("エントリの実データと記録されたサイズが一致しません。");
+            }
+
+            return Convert.ToHexString(hash.GetHashAndReset());
+        }
+        finally
         {
-            return null;
+            ArrayPool<byte>.Shared.Return(buffer);
         }
-
-        var entry = archive.Entries[candidate.ArchiveEntryIndex];
-        if (entry.Length != candidate.Size
-            || !string.Equals(entry.FullName, candidate.ArchiveEntryPath, StringComparison.Ordinal))
-        {
-            return null;
-        }
-
-        await using var stream = entry.Open();
-        var hash = await ComputeSha256Async(stream, cancellationToken).ConfigureAwait(false);
-        return new DuplicateFile(
-            candidate.DisplayPath,
-            candidate.RootPath,
-            entry.Length,
-            entry.LastWriteTime.UtcDateTime,
-            hash,
-            candidate.ArchivePath,
-            candidate.ArchiveEntryPath);
-    }
-
-    private static async Task<string> ComputeSha256Async(Stream stream, CancellationToken cancellationToken)
-    {
-        var hash = await SHA256.HashDataAsync(stream, cancellationToken).ConfigureAwait(false);
-        return Convert.ToHexString(hash);
     }
 
     private static IEnumerable<string> NormalizeRootPaths(IReadOnlyList<string> rootPaths)
@@ -433,7 +618,7 @@ public sealed class DuplicateScanner
         return archivePaths
             .Where(path => !string.IsNullOrWhiteSpace(path))
             .Select(path => Path.GetFullPath(path.Trim()))
-            .Where(path => File.Exists(path) && string.Equals(Path.GetExtension(path), ".zip", StringComparison.OrdinalIgnoreCase))
+            .Where(path => File.Exists(path) && IsSupportedArchivePath(path))
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToArray();
     }
@@ -452,17 +637,38 @@ public sealed class DuplicateScanner
     private static bool IsExpectedFileException(Exception ex)
     {
         return ex is IOException
-            or InvalidDataException
             or UnauthorizedAccessException
             or System.Security.SecurityException
+            or SharpCompressException
             or NotSupportedException
             or ArgumentException
             or PathTooLongException;
     }
 
+    private static string NormalizeArchiveEntryPath(string? entryPath, int entryIndex)
+    {
+        return string.IsNullOrWhiteSpace(entryPath)
+            ? $"(名称なしエントリ {entryIndex + 1:N0})"
+            : entryPath.Replace('/', '\\');
+    }
+
     private static string CreateArchiveDisplayPath(string archivePath, string entryPath)
     {
-        return $"{archivePath} :: {entryPath.Replace('/', '\\')}";
+        return $"{archivePath} :: {entryPath}";
+    }
+
+    private static string FormatSize(long bytes)
+    {
+        string[] units = ["B", "KB", "MB", "GB", "TB"];
+        var value = (double)bytes;
+        var unitIndex = 0;
+        while (value >= 1024 && unitIndex < units.Length - 1)
+        {
+            value /= 1024;
+            unitIndex++;
+        }
+
+        return unitIndex == 0 ? $"{bytes:N0} {units[unitIndex]}" : $"{value:N0} {units[unitIndex]}";
     }
 
     private sealed record FileCandidate(
@@ -477,5 +683,45 @@ public sealed class DuplicateScanner
         public bool IsArchiveEntry => ArchivePath is not null;
 
         public string DisplayPath => FullPath;
+    }
+
+    private sealed class ArchiveReaderSession : IDisposable
+    {
+        private readonly IReadOnlyList<IDisposable> _owners;
+
+        public ArchiveReaderSession(IReader reader, params IDisposable[] owners)
+        {
+            Reader = reader;
+            _owners = owners;
+        }
+
+        public IReader Reader { get; }
+
+        public void Dispose()
+        {
+            Exception? firstException = null;
+            TryDispose(Reader, ref firstException);
+            foreach (var owner in _owners)
+            {
+                TryDispose(owner, ref firstException);
+            }
+
+            if (firstException is not null)
+            {
+                throw firstException;
+            }
+        }
+
+        private static void TryDispose(IDisposable disposable, ref Exception? firstException)
+        {
+            try
+            {
+                disposable.Dispose();
+            }
+            catch (Exception ex)
+            {
+                firstException ??= ex;
+            }
+        }
     }
 }
