@@ -42,6 +42,7 @@ public sealed class MainForm : Form
     private readonly Button _openFolderButton = new();
     private readonly Button _recycleButton = new();
     private readonly Button _warningsButton = new();
+    private readonly Button _compareArchiveFolderButton = new();
     private readonly DataGridView _resultsGrid = new();
     private readonly ProgressBar _progressBar = new();
     private readonly Label _statusLabel = new();
@@ -324,8 +325,9 @@ public sealed class MainForm : Form
         _openFolderButton.Text = "フォルダーを開く";
         _recycleButton.Text = "選択ファイルをごみ箱へ";
         _warningsButton.Text = "警告を表示";
+        _compareArchiveFolderButton.Text = "圧縮⇔展開フォルダー比較";
 
-        foreach (var button in new[] { _exportButton, _openFileButton, _openFolderButton, _recycleButton, _warningsButton })
+        foreach (var button in new[] { _exportButton, _openFileButton, _openFolderButton, _recycleButton, _warningsButton, _compareArchiveFolderButton })
         {
             button.AutoSize = true;
             button.Margin = new Padding(0, 0, 8, 6);
@@ -373,6 +375,7 @@ public sealed class MainForm : Form
         _openFolderButton.Click += OpenFolderButton_Click;
         _recycleButton.Click += RecycleButton_Click;
         _warningsButton.Click += WarningsButton_Click;
+        _compareArchiveFolderButton.Click += CompareArchiveFolderButton_Click;
         _folderListBox.SelectedIndexChanged += (_, _) => UpdateActionButtons();
         _resultsGrid.SelectionChanged += (_, _) => UpdateActionButtons();
         _resultsGrid.RowPrePaint += ResultsGrid_RowPrePaint;
@@ -407,7 +410,7 @@ public sealed class MainForm : Form
         {
             CheckFileExists = true,
             Multiselect = true,
-            Filter = "対応する圧縮ファイル|*.zip;*.7z;*.tar;*.tar.gz;*.tgz;*.tar.bz2;*.tbz2;*.tbz;*.tar.xz;*.txz;*.tar.lz;*.tar.lzip;*.tlz;*.tar.zst;*.tar.zstd;*.tzst|すべてのファイル (*.*)|*.*",
+            Filter = DuplicateScanner.ArchiveFileDialogFilter,
             Title = "内容を比較する圧縮ファイルを選択",
             InitialDirectory = selectedPath is null
                 ? Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments)
@@ -682,6 +685,12 @@ public sealed class MainForm : Form
         MessageBox.Show(this, string.Join(Environment.NewLine, lines), "スキャン警告", MessageBoxButtons.OK, MessageBoxIcon.Warning);
     }
 
+    private void CompareArchiveFolderButton_Click(object? sender, EventArgs e)
+    {
+        using var comparisonForm = new ArchiveFolderComparisonForm();
+        comparisonForm.ShowDialog(this);
+    }
+
     private void ResultsGrid_RowPrePaint(object? sender, DataGridViewRowPrePaintEventArgs e)
     {
         if (e.RowIndex < 0 || _resultsGrid.Rows[e.RowIndex].DataBoundItem is not DuplicateFileRow row)
@@ -946,6 +955,7 @@ public sealed class MainForm : Form
         _openFolderButton.Enabled = !_isScanning && hasResultSelection;
         _recycleButton.Enabled = !_isScanning && hasResultSelection && !selectedRowsContainArchiveEntry;
         _warningsButton.Enabled = !_isScanning && _lastWarnings.Count > 0;
+        _compareArchiveFolderButton.Enabled = !_isScanning;
     }
 
     private IReadOnlyList<string> GetTargetFolders()

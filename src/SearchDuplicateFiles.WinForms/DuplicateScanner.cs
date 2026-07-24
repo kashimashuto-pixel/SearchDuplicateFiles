@@ -1,9 +1,7 @@
 using System.Buffers;
 using System.Diagnostics;
 using System.Security.Cryptography;
-using SharpCompress.Archives;
 using SharpCompress.Common;
-using SharpCompress.Readers;
 
 namespace SearchDuplicateFiles.WinForms;
 
@@ -65,6 +63,8 @@ public sealed record ScanProgress(
 
 public sealed class DuplicateScanner
 {
+    public const string ArchiveFileDialogFilter = "対応する圧縮ファイル|*.zip;*.7z;*.tar;*.tar.gz;*.tgz;*.tar.bz2;*.tbz2;*.tbz;*.tar.xz;*.txz;*.tar.lz;*.tar.lzip;*.tlz;*.tar.zst;*.tar.zstd;*.tzst|すべてのファイル (*.*)|*.*";
+
     private const int BufferSize = 1024 * 1024;
     private const int ProgressIntervalMilliseconds = 120;
     private const int MaximumArchiveEntries = 250_000;
@@ -329,7 +329,7 @@ public sealed class DuplicateScanner
     {
         try
         {
-            using var session = OpenArchiveReader(archivePath);
+            using var session = ArchiveStreamReader.Open(archivePath);
             var entryIndex = -1;
             var entryCount = 0;
             long totalSize = 0;
@@ -418,7 +418,7 @@ public sealed class DuplicateScanner
         var candidatesByIndex = candidates.ToDictionary(candidate => candidate.ArchiveEntryIndex);
         var remainingIndices = candidatesByIndex.Keys.ToHashSet();
 
-        using var session = OpenArchiveReader(archivePath);
+        using var session = ArchiveStreamReader.Open(archivePath);
         var entryIndex = -1;
 
         while (remainingIndices.Count > 0 && session.Reader.MoveToNextEntry())
@@ -460,34 +460,6 @@ public sealed class DuplicateScanner
         foreach (var missingIndex in remainingIndices)
         {
             warnings.Add($"スキップ: 圧縮ファイル内のエントリが見つかりませんでした: {candidatesByIndex[missingIndex].DisplayPath}");
-        }
-    }
-
-    private static ArchiveReaderSession OpenArchiveReader(string archivePath)
-    {
-        var stream = new FileStream(
-            archivePath,
-            FileMode.Open,
-            FileAccess.Read,
-            FileShare.Read,
-            BufferSize,
-            FileOptions.SequentialScan);
-
-        try
-        {
-            var options = ReaderOptions.ForExternalStream.WithExtensionHint(Path.GetFileName(archivePath));
-            if (archivePath.EndsWith(".7z", StringComparison.OrdinalIgnoreCase))
-            {
-                var archive = ArchiveFactory.OpenArchive(stream, options);
-                return new ArchiveReaderSession(archive.ExtractAllEntries(), archive, stream);
-            }
-
-            return new ArchiveReaderSession(ReaderFactory.OpenReader(stream, options), stream);
-        }
-        catch
-        {
-            stream.Dispose();
-            throw;
         }
     }
 
@@ -685,43 +657,4 @@ public sealed class DuplicateScanner
         public string DisplayPath => FullPath;
     }
 
-    private sealed class ArchiveReaderSession : IDisposable
-    {
-        private readonly IReadOnlyList<IDisposable> _owners;
-
-        public ArchiveReaderSession(IReader reader, params IDisposable[] owners)
-        {
-            Reader = reader;
-            _owners = owners;
-        }
-
-        public IReader Reader { get; }
-
-        public void Dispose()
-        {
-            Exception? firstException = null;
-            TryDispose(Reader, ref firstException);
-            foreach (var owner in _owners)
-            {
-                TryDispose(owner, ref firstException);
-            }
-
-            if (firstException is not null)
-            {
-                throw firstException;
-            }
-        }
-
-        private static void TryDispose(IDisposable disposable, ref Exception? firstException)
-        {
-            try
-            {
-                disposable.Dispose();
-            }
-            catch (Exception ex)
-            {
-                firstException ??= ex;
-            }
-        }
-    }
 }
