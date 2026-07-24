@@ -16,6 +16,7 @@ public sealed class ArchiveFolderComparisonForm : Form
     private readonly Button _warningsButton = new();
     private readonly Button _openLocationButton = new();
     private readonly CheckBox _showMatchesCheckBox = new();
+    private readonly CheckBox _ignoreTopLevelFolderCheckBox = new();
     private readonly DataGridView _resultsGrid = new();
     private readonly ProgressBar _progressBar = new();
     private readonly Label _statusLabel = new();
@@ -106,8 +107,12 @@ public sealed class ArchiveFolderComparisonForm : Form
         _compareButton.AutoSize = true;
         _cancelButton.Text = "キャンセル";
         _cancelButton.AutoSize = true;
+        _ignoreTopLevelFolderCheckBox.Text = "圧縮内の先頭フォルダー1階層を無視";
+        _ignoreTopLevelFolderCheckBox.AutoSize = true;
+        _ignoreTopLevelFolderCheckBox.Margin = new Padding(16, 5, 0, 0);
         actions.Controls.Add(_compareButton);
         actions.Controls.Add(_cancelButton);
+        actions.Controls.Add(_ignoreTopLevelFolderCheckBox);
 
         layout.Controls.Add(archiveLabel, 0, 0);
         layout.Controls.Add(_archivePathTextBox, 1, 0);
@@ -295,6 +300,7 @@ public sealed class ArchiveFolderComparisonForm : Form
 
         _comparisonCancellation = new CancellationTokenSource();
         var cancellationToken = _comparisonCancellation.Token;
+        var ignoreTopLevelFolder = _ignoreTopLevelFolderCheckBox.Checked;
         _lastResult = null;
         _rows.Clear();
         _isComparing = true;
@@ -306,7 +312,12 @@ public sealed class ArchiveFolderComparisonForm : Form
         {
             var progress = new Progress<ArchiveFolderComparisonProgress>(UpdateProgress);
             _lastResult = await Task.Run(
-                () => _comparer.Compare(archivePath, folderPath, progress, cancellationToken),
+                () => _comparer.Compare(
+                    archivePath,
+                    folderPath,
+                    progress,
+                    cancellationToken,
+                    ignoreTopLevelFolder),
                 cancellationToken);
             LoadVisibleRows();
         }
@@ -450,6 +461,7 @@ public sealed class ArchiveFolderComparisonForm : Form
         _browseFolderButton.Enabled = !_isComparing;
         _compareButton.Enabled = !_isComparing && canCompare;
         _cancelButton.Enabled = _isComparing;
+        _ignoreTopLevelFolderCheckBox.Enabled = !_isComparing;
         _showMatchesCheckBox.Enabled = !_isComparing && _lastResult is not null;
         _exportButton.Enabled = !_isComparing && _lastResult is not null;
         _warningsButton.Enabled = !_isComparing && _lastResult?.Warnings.Count > 0;
@@ -459,9 +471,10 @@ public sealed class ArchiveFolderComparisonForm : Form
     private static string CreateSummary(ArchiveFolderComparisonResult result)
     {
         var warningText = result.Warnings.Count == 0 ? string.Empty : $" / 警告 {result.Warnings.Count:N0} 件";
+        var pathModeText = result.IgnoredArchiveTopLevelFolder ? " / 先頭階層を除外" : string.Empty;
         return result.IsExactMatch
-            ? $"完全一致: {result.MatchCount:N0} ファイル / {result.Elapsed:mm\\:ss}"
-            : $"不一致 {result.DifferenceCount:N0} 件 / 一致 {result.MatchCount:N0} 件 / {result.Elapsed:mm\\:ss}{warningText}";
+            ? $"完全一致: {result.MatchCount:N0} ファイル / {result.Elapsed:mm\\:ss}{pathModeText}"
+            : $"不一致 {result.DifferenceCount:N0} 件 / 一致 {result.MatchCount:N0} 件 / {result.Elapsed:mm\\:ss}{pathModeText}{warningText}";
     }
 
     private static string GetStatusText(ArchiveFolderComparisonStatus status)

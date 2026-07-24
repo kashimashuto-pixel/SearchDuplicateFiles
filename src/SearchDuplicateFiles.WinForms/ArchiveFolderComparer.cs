@@ -28,6 +28,7 @@ public sealed record ArchiveFolderComparisonItem(
 public sealed record ArchiveFolderComparisonResult(
     string ArchivePath,
     string FolderPath,
+    bool IgnoredArchiveTopLevelFolder,
     IReadOnlyList<ArchiveFolderComparisonItem> Items,
     IReadOnlyList<string> Warnings,
     TimeSpan Elapsed)
@@ -55,7 +56,8 @@ public sealed class ArchiveFolderComparer
         string archivePath,
         string folderPath,
         IProgress<ArchiveFolderComparisonProgress>? progress,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool ignoreArchiveTopLevelFolder = false)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(archivePath);
         ArgumentException.ThrowIfNullOrWhiteSpace(folderPath);
@@ -135,6 +137,11 @@ public sealed class ArchiveFolderComparer
                         entry.Size >= 0 ? entry.Size : null,
                         null));
                     continue;
+                }
+
+                if (ignoreArchiveTopLevelFolder)
+                {
+                    relativePath = RemoveTopLevelFolder(relativePath);
                 }
 
                 if (!archivePathsSeen.Add(relativePath))
@@ -278,6 +285,7 @@ public sealed class ArchiveFolderComparer
         return new ArchiveFolderComparisonResult(
             archivePath,
             folderPath,
+            ignoreArchiveTopLevelFolder,
             items.OrderBy(item => item.RelativePath, StringComparer.OrdinalIgnoreCase)
                 .ThenBy(item => item.Status)
                 .ToArray(),
@@ -364,6 +372,14 @@ public sealed class ArchiveFolderComparer
     private static string NormalizeDisplayPath(string path)
     {
         return path.Replace('/', '\\');
+    }
+
+    private static string RemoveTopLevelFolder(string relativePath)
+    {
+        var separatorIndex = relativePath.IndexOf('\\');
+        return separatorIndex > 0 && separatorIndex < relativePath.Length - 1
+            ? relativePath[(separatorIndex + 1)..]
+            : relativePath;
     }
 
     private static string ComputeSha256(Stream stream, long expectedSize, CancellationToken cancellationToken)

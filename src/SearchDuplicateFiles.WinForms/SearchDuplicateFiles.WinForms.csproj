@@ -11,7 +11,7 @@
     <Product>Search Duplicate Files</Product>
     <Description>Windows Forms duplicate file finder.</Description>
     <Authors>kashimashuto-pixel</Authors>
-    <Version>1.3.0</Version>
+    <Version>1.4.0</Version>
   </PropertyGroup>
 
   <ItemGroup>
