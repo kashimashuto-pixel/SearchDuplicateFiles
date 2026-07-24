@@ -31,6 +31,7 @@ public sealed class MainForm : Form
     private readonly CheckBox _includeHiddenCheckBox = new();
     private readonly CheckBox _onlyAcrossFoldersCheckBox = new();
     private readonly Button _addFolderButton = new();
+    private readonly Button _addArchiveButton = new();
     private readonly Button _removeFolderButton = new();
     private readonly Button _clearFoldersButton = new();
     private readonly Button _scanButton = new();
@@ -53,6 +54,7 @@ public sealed class MainForm : Form
     private bool _isScanning;
     private bool _lastOnlyAcrossFolders;
     private int _lastScannedFolderCount;
+    private int _lastScannedArchiveCount;
     private DuplicateScanResult? _lastScanResult;
     private string? _sortPropertyName;
     private ListSortDirection _sortDirection = ListSortDirection.Ascending;
@@ -117,7 +119,7 @@ public sealed class MainForm : Form
 
         var label = new Label
         {
-            Text = "対象フォルダー",
+            Text = "検索対象",
             AutoSize = true,
             Anchor = AnchorStyles.Top | AnchorStyles.Left,
             Margin = new Padding(0, 6, 12, 0)
@@ -138,11 +140,12 @@ public sealed class MainForm : Form
             Margin = new Padding(0)
         };
 
-        _addFolderButton.Text = "追加...";
+        _addFolderButton.Text = "フォルダー...";
+        _addArchiveButton.Text = "ZIP...";
         _removeFolderButton.Text = "削除";
         _clearFoldersButton.Text = "クリア";
 
-        foreach (var button in new[] { _addFolderButton, _removeFolderButton, _clearFoldersButton })
+        foreach (var button in new[] { _addFolderButton, _addArchiveButton, _removeFolderButton, _clearFoldersButton })
         {
             button.Width = 90;
             button.Margin = new Padding(0, 0, 0, 6);
@@ -174,10 +177,10 @@ public sealed class MainForm : Form
         _includeHiddenCheckBox.AutoSize = true;
         _includeHiddenCheckBox.Margin = new Padding(0, 6, 16, 0);
 
-        _onlyAcrossFoldersCheckBox.Text = "対象フォルダー間の重複だけ表示";
+        _onlyAcrossFoldersCheckBox.Text = "異なる検索対象間の重複だけ表示";
         _onlyAcrossFoldersCheckBox.AutoSize = true;
         _onlyAcrossFoldersCheckBox.Margin = new Padding(0, 6, 16, 0);
-        _toolTip.SetToolTip(_onlyAcrossFoldersCheckBox, "2つ以上の対象フォルダーにまたがる重複だけを表示します。");
+        _toolTip.SetToolTip(_onlyAcrossFoldersCheckBox, "フォルダーとZIPなど、2つ以上の検索対象にまたがる重複だけを表示します。");
 
         var fileNamePatternLabel = new Label
         {
@@ -343,7 +346,7 @@ public sealed class MainForm : Form
         _progressBar.Height = 18;
         _progressBar.Margin = new Padding(0, 2, 10, 0);
 
-        _statusLabel.Text = "対象フォルダーを追加してください。";
+        _statusLabel.Text = "検索対象のフォルダーまたはZIPを追加してください。";
         _statusLabel.AutoEllipsis = true;
         _statusLabel.Dock = DockStyle.Fill;
         _statusLabel.TextAlign = ContentAlignment.MiddleLeft;
@@ -359,6 +362,7 @@ public sealed class MainForm : Form
     private void WireEvents()
     {
         _addFolderButton.Click += AddFolderButton_Click;
+        _addArchiveButton.Click += AddArchiveButton_Click;
         _removeFolderButton.Click += RemoveFolderButton_Click;
         _clearFoldersButton.Click += ClearFoldersButton_Click;
         _scanButton.Click += ScanButton_Click;
@@ -377,8 +381,8 @@ public sealed class MainForm : Form
 
     private void AddFolderButton_Click(object? sender, EventArgs e)
     {
-        var selectedPath = _folderListBox.SelectedItem as string
-            ?? _folderListBox.Items.Cast<string>().LastOrDefault()
+        var selectedPath = _folderListBox.SelectedItems.Cast<string>().FirstOrDefault(Directory.Exists)
+            ?? _folderListBox.Items.Cast<string>().LastOrDefault(Directory.Exists)
             ?? Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
 
         using var dialog = new FolderBrowserDialog
@@ -391,6 +395,31 @@ public sealed class MainForm : Form
         if (dialog.ShowDialog(this) == DialogResult.OK)
         {
             AddFolder(dialog.SelectedPath);
+        }
+    }
+
+    private void AddArchiveButton_Click(object? sender, EventArgs e)
+    {
+        var selectedPath = _folderListBox.SelectedItems.Cast<string>().FirstOrDefault(File.Exists)
+            ?? _folderListBox.Items.Cast<string>().LastOrDefault(File.Exists);
+
+        using var dialog = new OpenFileDialog
+        {
+            CheckFileExists = true,
+            Multiselect = true,
+            Filter = "ZIP アーカイブ (*.zip)|*.zip",
+            Title = "内容を比較するZIPアーカイブを選択",
+            InitialDirectory = selectedPath is null
+                ? Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments)
+                : Path.GetDirectoryName(selectedPath)
+        };
+
+        if (dialog.ShowDialog(this) == DialogResult.OK)
+        {
+            foreach (var archivePath in dialog.FileNames)
+            {
+                AddArchive(archivePath);
+            }
         }
     }
 
@@ -414,24 +443,33 @@ public sealed class MainForm : Form
     private async void ScanButton_Click(object? sender, EventArgs e)
     {
         var rootPaths = GetTargetFolders();
-        if (rootPaths.Count == 0)
+        var archivePaths = GetTargetArchives();
+        if (rootPaths.Count == 0 && archivePaths.Count == 0)
         {
-            MessageBox.Show(this, "対象フォルダーを1つ以上追加してください。", "フォルダー確認", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            MessageBox.Show(this, "検索対象のフォルダーまたはZIPを1つ以上追加してください。", "検索対象の確認", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
 
         var missingFolders = rootPaths.Where(path => !Directory.Exists(path)).ToArray();
-        if (missingFolders.Length > 0)
+        var missingArchives = archivePaths.Where(path => !File.Exists(path)).ToArray();
+        if (missingFolders.Length > 0 || missingArchives.Length > 0)
         {
-            MessageBox.Show(this, string.Join(Environment.NewLine, missingFolders), "存在しないフォルダー", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            MessageBox.Show(
+                this,
+                string.Join(Environment.NewLine, missingFolders.Concat(missingArchives)),
+                "存在しない検索対象",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
             return;
         }
 
         _lastOnlyAcrossFolders = _onlyAcrossFoldersCheckBox.Checked;
         _lastScannedFolderCount = rootPaths.Count;
+        _lastScannedArchiveCount = archivePaths.Count;
 
         var options = new ScanOptions(
             rootPaths,
+            archivePaths,
             _recursiveCheckBox.Checked,
             _includeHiddenCheckBox.Checked,
             _lastOnlyAcrossFolders,
@@ -530,13 +568,14 @@ public sealed class MainForm : Form
             return;
         }
 
-        if (!File.Exists(row.File.FullPath))
+        var physicalPath = row.File.ArchivePath ?? row.File.FullPath;
+        if (!File.Exists(physicalPath))
         {
             MessageBox.Show(this, "ファイルが見つかりません。", "ファイル確認", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
 
-        Process.Start(new ProcessStartInfo(row.File.FullPath) { UseShellExecute = true });
+        Process.Start(new ProcessStartInfo(physicalPath) { UseShellExecute = true });
     }
 
     private void OpenFolderButton_Click(object? sender, EventArgs e)
@@ -547,9 +586,10 @@ public sealed class MainForm : Form
             return;
         }
 
-        if (File.Exists(row.File.FullPath))
+        var physicalPath = row.File.ArchivePath ?? row.File.FullPath;
+        if (File.Exists(physicalPath))
         {
-            Process.Start("explorer.exe", $"/select,\"{row.File.FullPath}\"");
+            Process.Start("explorer.exe", $"/select,\"{physicalPath}\"");
             return;
         }
 
@@ -565,6 +605,17 @@ public sealed class MainForm : Form
         var selectedRows = GetSelectedRows().ToArray();
         if (selectedRows.Length == 0)
         {
+            return;
+        }
+
+        if (selectedRows.Any(row => row.File.IsArchiveEntry))
+        {
+            MessageBox.Show(
+                this,
+                "ZIP内のエントリは個別に削除できません。通常ファイルだけを選択してください。",
+                "ZIP内エントリ",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
             return;
         }
 
@@ -713,6 +764,19 @@ public sealed class MainForm : Form
         UpdateActionButtons();
     }
 
+    private void AddArchive(string archivePath)
+    {
+        var normalized = Path.GetFullPath(archivePath.Trim());
+        if (_folderListBox.Items.Cast<string>().Any(item => string.Equals(item, normalized, StringComparison.OrdinalIgnoreCase)))
+        {
+            return;
+        }
+
+        _folderListBox.Items.Add(normalized);
+        _folderListBox.SelectedItem = normalized;
+        UpdateActionButtons();
+    }
+
     private void LoadResult(DuplicateScanResult result)
     {
         _lastScanResult = result;
@@ -815,6 +879,7 @@ public sealed class MainForm : Form
         Cursor = isScanning ? Cursors.WaitCursor : Cursors.Default;
 
         _folderListBox.Enabled = !isScanning;
+        _addArchiveButton.Enabled = !isScanning;
         _recursiveCheckBox.Enabled = !isScanning;
         _includeHiddenCheckBox.Enabled = !isScanning;
         _onlyAcrossFoldersCheckBox.Enabled = !isScanning;
@@ -846,27 +911,29 @@ public sealed class MainForm : Form
 
     private void UpdateActionButtons()
     {
-        var hasFolders = _folderListBox.Items.Count > 0;
-        var canCompareFolders = _folderListBox.Items.Count > 1;
-        var hasFolderSelection = _folderListBox.SelectedItems.Count > 0;
+        var hasTargets = _folderListBox.Items.Count > 0;
+        var canCompareTargets = _folderListBox.Items.Count > 1;
+        var hasTargetSelection = _folderListBox.SelectedItems.Count > 0;
         var hasRows = _rows.Count > 0;
         var hasResultSelection = _resultsGrid.SelectedRows.Count > 0;
+        var selectedRowsContainArchiveEntry = GetSelectedRows().Any(row => row.File.IsArchiveEntry);
 
-        if (!_isScanning && !canCompareFolders)
+        if (!_isScanning && !canCompareTargets)
         {
             _onlyAcrossFoldersCheckBox.Checked = false;
         }
 
         _addFolderButton.Enabled = !_isScanning;
-        _removeFolderButton.Enabled = !_isScanning && hasFolderSelection;
-        _clearFoldersButton.Enabled = !_isScanning && hasFolders;
-        _scanButton.Enabled = !_isScanning && hasFolders;
+        _addArchiveButton.Enabled = !_isScanning;
+        _removeFolderButton.Enabled = !_isScanning && hasTargetSelection;
+        _clearFoldersButton.Enabled = !_isScanning && hasTargets;
+        _scanButton.Enabled = !_isScanning && hasTargets;
         _applyFilterButton.Enabled = !_isScanning && _lastScanResult is not null;
-        _onlyAcrossFoldersCheckBox.Enabled = !_isScanning && canCompareFolders;
+        _onlyAcrossFoldersCheckBox.Enabled = !_isScanning && canCompareTargets;
         _exportButton.Enabled = !_isScanning && hasRows;
         _openFileButton.Enabled = !_isScanning && hasResultSelection;
         _openFolderButton.Enabled = !_isScanning && hasResultSelection;
-        _recycleButton.Enabled = !_isScanning && hasResultSelection;
+        _recycleButton.Enabled = !_isScanning && hasResultSelection && !selectedRowsContainArchiveEntry;
         _warningsButton.Enabled = !_isScanning && _lastWarnings.Count > 0;
     }
 
@@ -874,7 +941,18 @@ public sealed class MainForm : Form
     {
         return _folderListBox.Items
             .Cast<string>()
+            .Where(path => !string.Equals(Path.GetExtension(path), ".zip", StringComparison.OrdinalIgnoreCase))
             .Select(NormalizeFolderPath)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
+    private IReadOnlyList<string> GetTargetArchives()
+    {
+        return _folderListBox.Items
+            .Cast<string>()
+            .Where(path => string.Equals(Path.GetExtension(path), ".zip", StringComparison.OrdinalIgnoreCase))
+            .Select(path => Path.GetFullPath(path.Trim()))
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToArray();
     }
@@ -910,8 +988,8 @@ public sealed class MainForm : Form
     private string CreateSummaryText(DuplicateScanResult result, IReadOnlyList<DuplicateFileGroup> visibleGroups)
     {
         var warningText = result.Warnings.Count == 0 ? string.Empty : $" / 警告 {result.Warnings.Count:N0} 件";
-        var comparisonText = _lastOnlyAcrossFolders ? " / フォルダー間のみ" : string.Empty;
-        var targetText = $"対象 {_lastScannedFolderCount:N0} フォルダー{comparisonText}";
+        var comparisonText = _lastOnlyAcrossFolders ? " / 異なる対象間のみ" : string.Empty;
+        var targetText = $"対象: フォルダー {_lastScannedFolderCount:N0} / ZIP {_lastScannedArchiveCount:N0}{comparisonText}";
         var duplicateFileCount = visibleGroups.Sum(group => group.Files.Count);
         var reclaimableBytes = visibleGroups.Sum(group => (group.Files.Count - 1) * group.Size);
         var filterText = visibleGroups.Count == result.Groups.Count ? string.Empty : $" / 絞り込み {visibleGroups.Count:N0}/{result.Groups.Count:N0} グループ";
@@ -939,8 +1017,8 @@ public sealed class MainForm : Form
         IReadOnlyList<string> fileNamePatterns,
         IReadOnlyList<string> folderNamePatterns)
     {
-        var matchesFileName = fileNamePatterns.Any(pattern => MatchesName(Path.GetFileName(file.FullPath), pattern));
-        var directory = Path.GetDirectoryName(file.FullPath) ?? string.Empty;
+        var matchesFileName = fileNamePatterns.Any(pattern => MatchesName(GetFileDisplayName(file), pattern));
+        var directory = GetFolderDisplayPath(file);
         var folderName = Path.GetFileName(Path.TrimEndingDirectorySeparator(directory));
         var matchesFolderName = folderNamePatterns.Any(pattern => MatchesName(folderName, pattern));
 
@@ -981,6 +1059,26 @@ public sealed class MainForm : Form
         var trimmed = Path.TrimEndingDirectorySeparator(folder);
         var name = Path.GetFileName(trimmed);
         return string.IsNullOrWhiteSpace(name) ? folder : name;
+    }
+
+    private static string GetFileDisplayName(DuplicateFile file)
+    {
+        return file.IsArchiveEntry
+            ? Path.GetFileName(file.ArchiveEntryPath!.Replace('/', '\\'))
+            : Path.GetFileName(file.FullPath);
+    }
+
+    private static string GetFolderDisplayPath(DuplicateFile file)
+    {
+        if (!file.IsArchiveEntry)
+        {
+            return Path.GetDirectoryName(file.FullPath) ?? string.Empty;
+        }
+
+        var entryDirectory = Path.GetDirectoryName(file.ArchiveEntryPath!.Replace('/', '\\'));
+        return string.IsNullOrEmpty(entryDirectory)
+            ? file.ArchivePath!
+            : $"{file.ArchivePath} :: {entryDirectory}";
     }
 
     private static string ShortenPath(string? path)
@@ -1038,9 +1136,9 @@ public sealed class MainForm : Form
 
         public string TargetFolder => GetFolderDisplayName(File.RootPath);
 
-        public string FileName => Path.GetFileName(File.FullPath);
+        public string FileName => GetFileDisplayName(File);
 
-        public string Folder => Path.GetDirectoryName(File.FullPath) ?? string.Empty;
+        public string Folder => GetFolderDisplayPath(File);
 
         public string SizeText => FormatSize(File.Size);
 
