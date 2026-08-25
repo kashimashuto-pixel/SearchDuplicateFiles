@@ -15,6 +15,7 @@ public sealed class ArchiveFolderComparisonForm : Form
     private readonly Button _exportButton = new();
     private readonly Button _warningsButton = new();
     private readonly Button _openLocationButton = new();
+    private readonly ComboBox _comparisonModeBox = new();
     private readonly CheckBox _showMatchesCheckBox = new();
     private readonly CheckBox _ignoreTopLevelFolderCheckBox = new();
     private readonly DataGridView _resultsGrid = new();
@@ -26,6 +27,8 @@ public sealed class ArchiveFolderComparisonForm : Form
     private CancellationTokenSource? _comparisonCancellation;
     private ArchiveFolderComparisonResult? _lastResult;
     private bool _isComparing;
+    private string? _sortPropertyName;
+    private ListSortDirection _sortDirection = ListSortDirection.Ascending;
 
     public ArchiveFolderComparisonForm()
     {
@@ -107,11 +110,28 @@ public sealed class ArchiveFolderComparisonForm : Form
         _compareButton.AutoSize = true;
         _cancelButton.Text = "キャンセル";
         _cancelButton.AutoSize = true;
+        var comparisonModeLabel = new Label
+        {
+            Text = "判定方法",
+            AutoSize = true,
+            Margin = new Padding(16, 6, 6, 0)
+        };
+        _comparisonModeBox.DropDownStyle = ComboBoxStyle.DropDownList;
+        _comparisonModeBox.Items.AddRange(
+            Enum.GetValues<FileComparisonMode>()
+                .Select(mode => mode.ToDisplayText())
+                .Cast<object>()
+                .ToArray());
+        _comparisonModeBox.SelectedIndex = (int)FileComparisonMode.Content;
+        _comparisonModeBox.Width = 170;
+        _comparisonModeBox.Margin = new Padding(0, 2, 0, 0);
         _ignoreTopLevelFolderCheckBox.Text = "圧縮内の先頭フォルダー1階層を無視";
         _ignoreTopLevelFolderCheckBox.AutoSize = true;
         _ignoreTopLevelFolderCheckBox.Margin = new Padding(16, 5, 0, 0);
         actions.Controls.Add(_compareButton);
         actions.Controls.Add(_cancelButton);
+        actions.Controls.Add(comparisonModeLabel);
+        actions.Controls.Add(_comparisonModeBox);
         actions.Controls.Add(_ignoreTopLevelFolderCheckBox);
 
         layout.Controls.Add(archiveLabel, 0, 0);
@@ -154,7 +174,7 @@ public sealed class ArchiveFolderComparisonForm : Form
             HeaderText = headerText,
             MinimumWidth = width,
             FillWeight = fillWeight,
-            SortMode = DataGridViewColumnSortMode.NotSortable
+            SortMode = DataGridViewColumnSortMode.Programmatic
         };
     }
 
@@ -226,6 +246,7 @@ public sealed class ArchiveFolderComparisonForm : Form
         _warningsButton.Click += WarningsButton_Click;
         _openLocationButton.Click += OpenLocationButton_Click;
         _resultsGrid.SelectionChanged += (_, _) => UpdateState();
+        _resultsGrid.ColumnHeaderMouseClick += ResultsGrid_ColumnHeaderMouseClick;
         _archivePathTextBox.TextChanged += (_, _) => UpdateState();
         _folderPathTextBox.TextChanged += (_, _) => UpdateState();
         FormClosing += ArchiveFolderComparisonForm_FormClosing;
@@ -301,6 +322,7 @@ public sealed class ArchiveFolderComparisonForm : Form
         _comparisonCancellation = new CancellationTokenSource();
         var cancellationToken = _comparisonCancellation.Token;
         var ignoreTopLevelFolder = _ignoreTopLevelFolderCheckBox.Checked;
+        var comparisonMode = GetSelectedComparisonMode();
         _lastResult = null;
         _rows.Clear();
         _isComparing = true;
@@ -317,7 +339,8 @@ public sealed class ArchiveFolderComparisonForm : Form
                     folderPath,
                     progress,
                     cancellationToken,
-                    ignoreTopLevelFolder),
+                    ignoreTopLevelFolder,
+                    comparisonMode),
                 cancellationToken);
             LoadVisibleRows();
         }
@@ -343,14 +366,80 @@ public sealed class ArchiveFolderComparisonForm : Form
 
     private void UpdateProgress(ArchiveFolderComparisonProgress progress)
     {
-        _statusLabel.Text = $"{progress.Stage}: {progress.ItemsProcessed:N0} 件 {ShortenPath(progress.CurrentPath)}";
+        var details = progress.ItemsProcessed > 0
+            ? $"{progress.ItemsProcessed:N0} 件"
+            : string.Empty;
+        var currentPath = ShortenPath(progress.CurrentPath);
+        if (!string.IsNullOrEmpty(currentPath))
+        {
+            details = string.IsNullOrEmpty(details) ? currentPath : $"{details} {currentPath}";
+        }
+
+        _statusLabel.Text = string.IsNullOrEmpty(details)
+            ? progress.Stage
+            : $"{progress.Stage}: {details}";
+    }
+
+    private void ResultsGrid_ColumnHeaderMouseClick(object? sender, DataGridViewCellMouseEventArgs e)
+    {
+        if (_isComparing
+            || e.ColumnIndex < 0
+            || _resultsGrid.Columns[e.ColumnIndex] is not DataGridViewColumn column)
+        {
+            return;
+        }
+
+        var propertyName = column.DataPropertyName;
+        _sortDirection = string.Equals(_sortPropertyName, propertyName, StringComparison.Ordinal)
+            ? (_sortDirection == ListSortDirection.Ascending ? ListSortDirection.Descending : ListSortDirection.Ascending)
+            : ListSortDirection.Ascending;
+        _sortPropertyName = propertyName;
+
+        ApplyResultSort();
+
+        foreach (DataGridViewColumn gridColumn in _resultsGrid.Columns)
+        {
+            gridColumn.HeaderCell.SortGlyphDirection = gridColumn == column
+                ? (_sortDirection == ListSortDirection.Ascending ? SortOrder.Ascending : SortOrder.Descending)
+                : SortOrder.None;
+        }
+    }
+
+    private void ApplyResultSort()
+    {
+        IEnumerable<ComparisonRow> sortedRows = _sortPropertyName switch
+        {
+            nameof(ComparisonRow.StatusText) => _rows.OrderBy(row => row.StatusText, StringComparer.CurrentCultureIgnoreCase),
+            nameof(ComparisonRow.RelativePath) => _rows.OrderBy(row => row.RelativePath, StringComparer.CurrentCultureIgnoreCase),
+            nameof(ComparisonRow.ArchiveSizeText) => _rows.OrderBy(row => row.Item.ArchiveSize ?? long.MinValue),
+            nameof(ComparisonRow.FolderSizeText) => _rows.OrderBy(row => row.Item.FolderSize ?? long.MinValue),
+            _ => _rows.OrderBy(row => row.RelativePath, StringComparer.CurrentCultureIgnoreCase)
+        };
+
+        var snapshot = (_sortDirection == ListSortDirection.Descending ? sortedRows.Reverse() : sortedRows).ToArray();
+        _rows.RaiseListChangedEvents = false;
+        try
+        {
+            _rows.Clear();
+            foreach (var row in snapshot)
+            {
+                _rows.Add(row);
+            }
+        }
+        finally
+        {
+            _rows.RaiseListChangedEvents = true;
+            _rows.ResetBindings();
+        }
+
+        _resultsGrid.ClearSelection();
     }
 
     private void LoadVisibleRows()
     {
-        _rows.Clear();
         if (_lastResult is null)
         {
+            ReplaceRows([]);
             UpdateState();
             return;
         }
@@ -358,9 +447,10 @@ public sealed class ArchiveFolderComparisonForm : Form
         var visibleItems = _showMatchesCheckBox.Checked
             ? _lastResult.Items
             : _lastResult.Items.Where(item => item.Status != ArchiveFolderComparisonStatus.Match);
-        foreach (var item in visibleItems)
+        ReplaceRows(visibleItems);
+        if (_sortPropertyName is not null)
         {
-            _rows.Add(new ComparisonRow(item));
+            ApplyResultSort();
         }
 
         _resultsGrid.ClearSelection();
@@ -369,6 +459,26 @@ public sealed class ArchiveFolderComparisonForm : Form
         _progressBar.Maximum = 1;
         _progressBar.Value = 1;
         UpdateState();
+    }
+
+    private void ReplaceRows(IEnumerable<ArchiveFolderComparisonItem> items)
+    {
+        _resultsGrid.SuspendLayout();
+        _rows.RaiseListChangedEvents = false;
+        try
+        {
+            _rows.Clear();
+            foreach (var item in items)
+            {
+                _rows.Add(new ComparisonRow(item));
+            }
+        }
+        finally
+        {
+            _rows.RaiseListChangedEvents = true;
+            _rows.ResetBindings();
+            _resultsGrid.ResumeLayout();
+        }
     }
 
     private void ExportButton_Click(object? sender, EventArgs e)
@@ -461,6 +571,7 @@ public sealed class ArchiveFolderComparisonForm : Form
         _browseFolderButton.Enabled = !_isComparing;
         _compareButton.Enabled = !_isComparing && canCompare;
         _cancelButton.Enabled = _isComparing;
+        _comparisonModeBox.Enabled = !_isComparing;
         _ignoreTopLevelFolderCheckBox.Enabled = !_isComparing;
         _showMatchesCheckBox.Enabled = !_isComparing && _lastResult is not null;
         _exportButton.Enabled = !_isComparing && _lastResult is not null;
@@ -472,9 +583,17 @@ public sealed class ArchiveFolderComparisonForm : Form
     {
         var warningText = result.Warnings.Count == 0 ? string.Empty : $" / 警告 {result.Warnings.Count:N0} 件";
         var pathModeText = result.IgnoredArchiveTopLevelFolder ? " / 先頭階層を除外" : string.Empty;
+        var comparisonModeText = $" / 判定 {result.ComparisonMode.ToDisplayText()}";
         return result.IsExactMatch
-            ? $"完全一致: {result.MatchCount:N0} ファイル / {result.Elapsed:mm\\:ss}{pathModeText}"
-            : $"不一致 {result.DifferenceCount:N0} 件 / 一致 {result.MatchCount:N0} 件 / {result.Elapsed:mm\\:ss}{pathModeText}{warningText}";
+            ? $"完全一致: {result.MatchCount:N0} ファイル / {result.Elapsed:mm\\:ss}{comparisonModeText}{pathModeText}"
+            : $"不一致 {result.DifferenceCount:N0} 件 / 一致 {result.MatchCount:N0} 件 / {result.Elapsed:mm\\:ss}{comparisonModeText}{pathModeText}{warningText}";
+    }
+
+    private FileComparisonMode GetSelectedComparisonMode()
+    {
+        return Enum.IsDefined(typeof(FileComparisonMode), _comparisonModeBox.SelectedIndex)
+            ? (FileComparisonMode)_comparisonModeBox.SelectedIndex
+            : FileComparisonMode.Content;
     }
 
     private static string GetStatusText(ArchiveFolderComparisonStatus status)

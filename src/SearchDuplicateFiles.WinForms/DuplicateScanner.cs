@@ -11,7 +11,8 @@ public sealed record ScanOptions(
     bool IncludeSubdirectories,
     bool IncludeHiddenAndSystemFiles,
     bool OnlyShowAcrossDifferentRootFolders,
-    long MinimumSizeBytes);
+    long MinimumSizeBytes,
+    FileComparisonMode ComparisonMode = FileComparisonMode.Content);
 
 public sealed record DuplicateFile(
     string FullPath,
@@ -37,18 +38,22 @@ public sealed record DuplicateScanResult(
     int CandidateFiles,
     int FilesHashed,
     IReadOnlyList<string> Warnings,
-    TimeSpan Elapsed)
+    TimeSpan Elapsed,
+    FileComparisonMode ComparisonMode = FileComparisonMode.Content)
 {
     public int DuplicateFileCount => Groups.Sum(group => group.Files.Count);
 
     public int ExtraDuplicateFileCount => Groups.Sum(group => group.Files.Count - 1);
 
-    public long ReclaimableBytes => Groups.Sum(group => (group.Files.Count - 1) * group.Size);
+    public long ReclaimableBytes => ComparisonMode == FileComparisonMode.Content
+        ? Groups.Sum(group => (group.Files.Count - 1) * group.Size)
+        : 0;
 }
 
 public enum ScanStage
 {
     Enumerating,
+    Comparing,
     Hashing,
     Finished
 }
@@ -144,6 +149,54 @@ public sealed class DuplicateScanner
         {
             cancellationToken.ThrowIfCancellationRequested();
             EnumerateArchive(archivePath, options, filesBySize, warnings, ReportProgress, ref filesSeen, cancellationToken);
+        }
+
+        if (options.ComparisonMode != FileComparisonMode.Content)
+        {
+            ReportProgress(new ScanProgress(ScanStage.Comparing, filesSeen, filesSeen, 0, 0, null), force: true);
+            var matchingFileSets = filesBySize.Values
+                .SelectMany(files => files)
+                .Select(CreateUnhashedDuplicateFile)
+                .GroupBy(
+                    file => CreateComparisonKey(file, options.ComparisonMode),
+                    StringComparer.OrdinalIgnoreCase)
+                .Select(group => group
+                    .OrderBy(file => file.RootPath, StringComparer.OrdinalIgnoreCase)
+                    .ThenBy(file => file.FullPath, StringComparer.OrdinalIgnoreCase)
+                    .ToArray())
+                .Where(files => IsDuplicateGroup(files, options.OnlyShowAcrossDifferentRootFolders))
+                .OrderBy(files => GetComparisonFileName(files[0]), StringComparer.OrdinalIgnoreCase)
+                .ThenBy(files => files[0].Size)
+                .ToArray();
+
+            cancellationToken.ThrowIfCancellationRequested();
+            var candidateFileCount = matchingFileSets.Sum(files => files.Length);
+            var nameBasedGroups = matchingFileSets
+                .Select((files, index) => new DuplicateFileGroup(
+                    index + 1,
+                    files[0].Size,
+                    string.Empty,
+                    files))
+                .ToArray();
+
+            stopwatch.Stop();
+            ReportProgress(new ScanProgress(
+                ScanStage.Finished,
+                filesSeen,
+                candidateFileCount,
+                0,
+                nameBasedGroups.Length,
+                null),
+                force: true);
+
+            return new DuplicateScanResult(
+                nameBasedGroups,
+                filesSeen,
+                candidateFileCount,
+                0,
+                warnings,
+                stopwatch.Elapsed,
+                options.ComparisonMode);
         }
 
         var candidateFiles = filesBySize
@@ -251,7 +304,14 @@ public sealed class DuplicateScanner
         stopwatch.Stop();
         ReportProgress(new ScanProgress(ScanStage.Finished, filesSeen, candidateFiles.Count, filesHashed, groups.Length, null), force: true);
 
-        return new DuplicateScanResult(groups, filesSeen, candidateFiles.Count, filesHashed, warnings, stopwatch.Elapsed);
+        return new DuplicateScanResult(
+            groups,
+            filesSeen,
+            candidateFiles.Count,
+            filesHashed,
+            warnings,
+            stopwatch.Elapsed,
+            options.ComparisonMode);
     }
 
     private static void EnumerateFiles(
@@ -329,12 +389,12 @@ public sealed class DuplicateScanner
     {
         try
         {
-            using var session = ArchiveStreamReader.Open(archivePath);
             var entryIndex = -1;
             var entryCount = 0;
+            var archiveFilesSeen = filesSeen;
             long totalSize = 0;
 
-            while (session.Reader.MoveToNextEntry())
+            bool AddArchiveEntry(IEntry entry)
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 entryIndex++;
@@ -343,48 +403,53 @@ public sealed class DuplicateScanner
                 if (entryCount > MaximumArchiveEntries)
                 {
                     warnings.Add($"圧縮ファイルのエントリ数が上限 {MaximumArchiveEntries:N0} 件を超えたため、残りをスキップしました: {archivePath}");
-                    break;
+                    return false;
                 }
 
-                var entry = session.Reader.Entry;
                 if (entry.IsDirectory || !string.IsNullOrWhiteSpace(entry.LinkTarget))
                 {
-                    continue;
+                    return true;
                 }
 
                 var entryPath = NormalizeArchiveEntryPath(entry.Key, entryIndex);
-                filesSeen++;
+                archiveFilesSeen++;
                 var displayPath = CreateArchiveDisplayPath(archivePath, entryPath);
-                reportProgress(new ScanProgress(ScanStage.Enumerating, filesSeen, 0, 0, 0, displayPath), false);
+                reportProgress(new ScanProgress(ScanStage.Enumerating, archiveFilesSeen, 0, 0, 0, displayPath), false);
 
-                if (entry.IsEncrypted)
+                if (options.ComparisonMode == FileComparisonMode.Content && entry.IsEncrypted)
                 {
                     warnings.Add($"スキップ: 暗号化されたエントリには対応していません: {displayPath}");
-                    continue;
+                    return true;
                 }
 
                 if (entry.Size < 0)
                 {
                     warnings.Add($"スキップ: サイズを取得できませんでした: {displayPath}");
-                    continue;
+                    return true;
                 }
 
-                if (entry.Size > MaximumArchiveEntrySizeBytes)
+                if (options.ComparisonMode == FileComparisonMode.Content
+                    && entry.Size > MaximumArchiveEntrySizeBytes)
                 {
                     warnings.Add($"展開後サイズが安全上限 {FormatSize(MaximumArchiveEntrySizeBytes)} を超えたため、この圧縮ファイルの残りをスキップしました: {displayPath}");
-                    break;
+                    return false;
                 }
 
-                if (totalSize > MaximumArchiveTotalSizeBytes - entry.Size)
+                if (options.ComparisonMode == FileComparisonMode.Content
+                    && totalSize > MaximumArchiveTotalSizeBytes - entry.Size)
                 {
                     warnings.Add($"圧縮ファイルの展開後合計サイズが安全上限 {FormatSize(MaximumArchiveTotalSizeBytes)} を超えたため、残りをスキップしました: {archivePath}");
-                    break;
+                    return false;
                 }
 
-                totalSize += entry.Size;
+                if (options.ComparisonMode == FileComparisonMode.Content)
+                {
+                    totalSize += entry.Size;
+                }
+
                 if (entry.Size < options.MinimumSizeBytes || ShouldSkipArchiveEntry(entry, archivePath, options))
                 {
-                    continue;
+                    return true;
                 }
 
                 AddCandidate(filesBySize, new FileCandidate(
@@ -395,7 +460,36 @@ public sealed class DuplicateScanner
                     archivePath,
                     entryPath,
                     entryIndex));
+
+                return true;
             }
+
+            reportProgress(new ScanProgress(ScanStage.Enumerating, archiveFilesSeen, 0, 0, 0, archivePath), true);
+            if (options.ComparisonMode != FileComparisonMode.Content
+                && archivePath.EndsWith(".7z", StringComparison.OrdinalIgnoreCase))
+            {
+                using var session = ArchiveStreamReader.OpenMetadata(archivePath);
+                foreach (var entry in session.Archive.Entries)
+                {
+                    if (!AddArchiveEntry(entry))
+                    {
+                        break;
+                    }
+                }
+            }
+            else
+            {
+                using var session = ArchiveStreamReader.Open(archivePath);
+                while (session.Reader.MoveToNextEntry())
+                {
+                    if (!AddArchiveEntry(session.Reader.Entry))
+                    {
+                        break;
+                    }
+                }
+            }
+
+            filesSeen = archiveFilesSeen;
         }
         catch (OperationCanceledException)
         {
@@ -540,6 +634,35 @@ public sealed class DuplicateScanner
             currentInfo.Length,
             currentInfo.LastWriteTimeUtc,
             Convert.ToHexString(hash));
+    }
+
+    private static DuplicateFile CreateUnhashedDuplicateFile(FileCandidate candidate)
+    {
+        return new DuplicateFile(
+            candidate.FullPath,
+            candidate.RootPath,
+            candidate.Size,
+            candidate.LastWriteTimeUtc,
+            string.Empty,
+            candidate.ArchivePath,
+            candidate.ArchiveEntryPath);
+    }
+
+    private static string CreateComparisonKey(DuplicateFile file, FileComparisonMode comparisonMode)
+    {
+        var fileName = GetComparisonFileName(file);
+        return comparisonMode switch
+        {
+            FileComparisonMode.FileName => fileName,
+            FileComparisonMode.FileNameAndSize => $"{fileName}\0{file.Size}",
+            _ => throw new ArgumentOutOfRangeException(nameof(comparisonMode))
+        };
+    }
+
+    private static string GetComparisonFileName(DuplicateFile file)
+    {
+        var path = file.ArchiveEntryPath ?? file.FullPath;
+        return Path.GetFileName(path.Replace('/', '\\'));
     }
 
     private static string ComputeSha256(Stream stream, long expectedSize, CancellationToken cancellationToken)

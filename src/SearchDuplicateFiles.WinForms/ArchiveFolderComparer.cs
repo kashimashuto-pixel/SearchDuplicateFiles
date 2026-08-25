@@ -31,7 +31,8 @@ public sealed record ArchiveFolderComparisonResult(
     bool IgnoredArchiveTopLevelFolder,
     IReadOnlyList<ArchiveFolderComparisonItem> Items,
     IReadOnlyList<string> Warnings,
-    TimeSpan Elapsed)
+    TimeSpan Elapsed,
+    FileComparisonMode ComparisonMode = FileComparisonMode.Content)
 {
     public int MatchCount => Items.Count(item => item.Status == ArchiveFolderComparisonStatus.Match);
 
@@ -48,6 +49,7 @@ public sealed record ArchiveFolderComparisonProgress(
 public sealed class ArchiveFolderComparer
 {
     private const int BufferSize = 1024 * 1024;
+    private const int ProgressIntervalMilliseconds = 120;
     private const int MaximumArchiveEntries = 250_000;
     private const long MaximumArchiveEntrySizeBytes = 64L * 1024 * 1024 * 1024;
     private const long MaximumArchiveTotalSizeBytes = 512L * 1024 * 1024 * 1024;
@@ -57,7 +59,8 @@ public sealed class ArchiveFolderComparer
         string folderPath,
         IProgress<ArchiveFolderComparisonProgress>? progress,
         CancellationToken cancellationToken,
-        bool ignoreArchiveTopLevelFolder = false)
+        bool ignoreArchiveTopLevelFolder = false,
+        FileComparisonMode comparisonMode = FileComparisonMode.Content)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(archivePath);
         ArgumentException.ThrowIfNullOrWhiteSpace(folderPath);
@@ -80,20 +83,39 @@ public sealed class ArchiveFolderComparer
         }
 
         var stopwatch = Stopwatch.StartNew();
+        var progressStopwatch = Stopwatch.StartNew();
         var warnings = new List<string>();
         var items = new List<ArchiveFolderComparisonItem>();
-        var folderFiles = EnumerateFolder(folderPath, warnings, progress, cancellationToken);
+
+        void ReportProgress(ArchiveFolderComparisonProgress comparisonProgress, bool force = false)
+        {
+            if (progress is null)
+            {
+                return;
+            }
+
+            if (!force && progressStopwatch.ElapsedMilliseconds < ProgressIntervalMilliseconds)
+            {
+                return;
+            }
+
+            progress.Report(comparisonProgress);
+            progressStopwatch.Restart();
+        }
+
+        ReportProgress(new ArchiveFolderComparisonProgress("フォルダーの列挙を準備中", 0, folderPath), force: true);
+        var folderFiles = EnumerateFolder(folderPath, warnings, ReportProgress, cancellationToken);
+        ReportProgress(new ArchiveFolderComparisonProgress("圧縮ファイルを解析中", 0, archivePath), force: true);
         var archivePathsSeen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var matchedFolderPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var itemsProcessed = 0;
 
         try
         {
-            using var session = ArchiveStreamReader.Open(archivePath);
             var entryCount = 0;
             long totalSize = 0;
 
-            while (session.Reader.MoveToNextEntry())
+            bool CompareEntry(IEntry entry, Func<Stream>? openEntryStream)
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 entryCount++;
@@ -105,18 +127,17 @@ public sealed class ArchiveFolderComparer
                         ArchiveFolderComparisonStatus.Unreadable,
                         null,
                         null));
-                    break;
+                    return false;
                 }
 
-                var entry = session.Reader.Entry;
                 if (entry.IsDirectory)
                 {
-                    continue;
+                    return true;
                 }
 
                 itemsProcessed++;
                 var originalEntryPath = entry.Key ?? $"(名称なしエントリ {entryCount:N0})";
-                progress?.Report(new ArchiveFolderComparisonProgress("圧縮ファイルを比較中", itemsProcessed, originalEntryPath));
+                ReportProgress(new ArchiveFolderComparisonProgress("圧縮ファイルを比較中", itemsProcessed, originalEntryPath));
 
                 if (!string.IsNullOrWhiteSpace(entry.LinkTarget))
                 {
@@ -125,7 +146,7 @@ public sealed class ArchiveFolderComparer
                         ArchiveFolderComparisonStatus.UnsupportedEntry,
                         entry.Size >= 0 ? entry.Size : null,
                         null));
-                    continue;
+                    return true;
                 }
 
                 if (!TryNormalizeRelativePath(originalEntryPath, out var relativePath))
@@ -136,7 +157,7 @@ public sealed class ArchiveFolderComparer
                         ArchiveFolderComparisonStatus.Unreadable,
                         entry.Size >= 0 ? entry.Size : null,
                         null));
-                    continue;
+                    return true;
                 }
 
                 if (ignoreArchiveTopLevelFolder)
@@ -151,10 +172,10 @@ public sealed class ArchiveFolderComparer
                         ArchiveFolderComparisonStatus.DuplicateArchivePath,
                         entry.Size >= 0 ? entry.Size : null,
                         folderFiles.TryGetValue(relativePath, out var duplicateFolderFile) ? duplicateFolderFile.Size : null));
-                    continue;
+                    return true;
                 }
 
-                if (entry.IsEncrypted)
+                if (comparisonMode == FileComparisonMode.Content && entry.IsEncrypted)
                 {
                     matchedFolderPaths.Add(relativePath);
                     items.Add(new ArchiveFolderComparisonItem(
@@ -162,45 +183,71 @@ public sealed class ArchiveFolderComparer
                         ArchiveFolderComparisonStatus.Unreadable,
                         entry.Size >= 0 ? entry.Size : null,
                         folderFiles.TryGetValue(relativePath, out var encryptedFolderFile) ? encryptedFolderFile.Size : null));
-                    warnings.Add($"暗号化されたエントリは比較できません: {relativePath}");
-                    continue;
+                    warnings.Add($"暗号化されたエントリの内容は比較できません: {relativePath}");
+                    return true;
                 }
 
-                if (entry.Size < 0 || entry.Size > MaximumArchiveEntrySizeBytes)
+                if (comparisonMode != FileComparisonMode.FileName && entry.Size < 0)
                 {
                     matchedFolderPaths.Add(relativePath);
                     items.Add(new ArchiveFolderComparisonItem(
                         relativePath,
                         ArchiveFolderComparisonStatus.Unreadable,
-                        entry.Size >= 0 ? entry.Size : null,
-                        folderFiles.TryGetValue(relativePath, out var oversizedFolderFile) ? oversizedFolderFile.Size : null));
-                    warnings.Add($"展開後サイズが不明または安全上限を超えています: {relativePath}");
-                    break;
-                }
-
-                if (totalSize > MaximumArchiveTotalSizeBytes - entry.Size)
-                {
-                    warnings.Add("圧縮ファイルの展開後合計サイズが安全上限を超えたため、比較を中断しました。");
-                    items.Add(new ArchiveFolderComparisonItem(
-                        "（安全上限を超えた残りのエントリ）",
-                        ArchiveFolderComparisonStatus.Unreadable,
                         null,
-                        null));
-                    break;
+                        folderFiles.TryGetValue(relativePath, out var unknownSizeFolderFile) ? unknownSizeFolderFile.Size : null));
+                    warnings.Add($"展開後サイズが不明なため比較できません: {relativePath}");
+                    return true;
                 }
 
-                totalSize += entry.Size;
+                if (comparisonMode == FileComparisonMode.Content)
+                {
+                    if (entry.Size > MaximumArchiveEntrySizeBytes)
+                    {
+                        matchedFolderPaths.Add(relativePath);
+                        items.Add(new ArchiveFolderComparisonItem(
+                            relativePath,
+                            ArchiveFolderComparisonStatus.Unreadable,
+                            entry.Size,
+                            folderFiles.TryGetValue(relativePath, out var oversizedFolderFile) ? oversizedFolderFile.Size : null));
+                        warnings.Add($"展開後サイズが安全上限を超えています: {relativePath}");
+                        return false;
+                    }
+
+                    if (totalSize > MaximumArchiveTotalSizeBytes - entry.Size)
+                    {
+                        warnings.Add("圧縮ファイルの展開後合計サイズが安全上限を超えたため、比較を中断しました。");
+                        items.Add(new ArchiveFolderComparisonItem(
+                            "（安全上限を超えた残りのエントリ）",
+                            ArchiveFolderComparisonStatus.Unreadable,
+                            null,
+                            null));
+                        return false;
+                    }
+
+                    totalSize += entry.Size;
+                }
+
                 if (!folderFiles.TryGetValue(relativePath, out var folderFile))
                 {
                     items.Add(new ArchiveFolderComparisonItem(
                         relativePath,
                         ArchiveFolderComparisonStatus.ArchiveOnly,
-                        entry.Size,
+                        entry.Size >= 0 ? entry.Size : null,
                         null));
-                    continue;
+                    return true;
                 }
 
                 matchedFolderPaths.Add(relativePath);
+                if (comparisonMode == FileComparisonMode.FileName)
+                {
+                    items.Add(new ArchiveFolderComparisonItem(
+                        relativePath,
+                        ArchiveFolderComparisonStatus.Match,
+                        entry.Size >= 0 ? entry.Size : null,
+                        folderFile.Size));
+                    return true;
+                }
+
                 if (entry.Size != folderFile.Size)
                 {
                     items.Add(new ArchiveFolderComparisonItem(
@@ -208,7 +255,17 @@ public sealed class ArchiveFolderComparer
                         ArchiveFolderComparisonStatus.SizeMismatch,
                         entry.Size,
                         folderFile.Size));
-                    continue;
+                    return true;
+                }
+
+                if (comparisonMode == FileComparisonMode.FileNameAndSize)
+                {
+                    items.Add(new ArchiveFolderComparisonItem(
+                        relativePath,
+                        ArchiveFolderComparisonStatus.Match,
+                        entry.Size,
+                        folderFile.Size));
+                    return true;
                 }
 
                 try
@@ -219,7 +276,8 @@ public sealed class ArchiveFolderComparer
                         throw new IOException("比較中にフォルダー側のファイルが変更されました。");
                     }
 
-                    using var entryStream = session.Reader.OpenEntryStream();
+                    using var entryStream = openEntryStream?.Invoke()
+                        ?? throw new InvalidOperationException("圧縮ファイルの内容を読み取るストリームがありません。");
                     var archiveHash = ComputeSha256(entryStream, entry.Size, cancellationToken);
                     using var folderStream = new FileStream(
                         folderFile.FullPath,
@@ -254,6 +312,35 @@ public sealed class ArchiveFolderComparer
                         entry.Size,
                         folderFile.Size));
                 }
+
+                return true;
+            }
+
+            if (comparisonMode != FileComparisonMode.Content
+                && archivePath.EndsWith(".7z", StringComparison.OrdinalIgnoreCase))
+            {
+                using var session = ArchiveStreamReader.OpenMetadata(archivePath);
+                var entries = session.Archive.Entries.ToArray();
+                ReportProgress(new ArchiveFolderComparisonProgress("圧縮ファイルを比較中", 0, archivePath), force: true);
+                foreach (var entry in entries)
+                {
+                    if (!CompareEntry(entry, null))
+                    {
+                        break;
+                    }
+                }
+            }
+            else
+            {
+                using var session = ArchiveStreamReader.Open(archivePath);
+                ReportProgress(new ArchiveFolderComparisonProgress("圧縮ファイルを比較中", 0, archivePath), force: true);
+                while (session.Reader.MoveToNextEntry())
+                {
+                    if (!CompareEntry(session.Reader.Entry, () => session.Reader.OpenEntryStream()))
+                    {
+                        break;
+                    }
+                }
             }
         }
         catch (OperationCanceledException)
@@ -281,6 +368,7 @@ public sealed class ArchiveFolderComparer
                 folderFile.Size));
         }
 
+        ReportProgress(new ArchiveFolderComparisonProgress("比較結果を整理中", itemsProcessed, null), force: true);
         stopwatch.Stop();
         return new ArchiveFolderComparisonResult(
             archivePath,
@@ -290,13 +378,14 @@ public sealed class ArchiveFolderComparer
                 .ThenBy(item => item.Status)
                 .ToArray(),
             warnings,
-            stopwatch.Elapsed);
+            stopwatch.Elapsed,
+            comparisonMode);
     }
 
     private static Dictionary<string, FolderFile> EnumerateFolder(
         string folderPath,
         List<string> warnings,
-        IProgress<ArchiveFolderComparisonProgress>? progress,
+        Action<ArchiveFolderComparisonProgress, bool> reportProgress,
         CancellationToken cancellationToken)
     {
         var result = new Dictionary<string, FolderFile>(StringComparer.OrdinalIgnoreCase);
@@ -314,7 +403,7 @@ public sealed class ArchiveFolderComparer
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 filesProcessed++;
-                progress?.Report(new ArchiveFolderComparisonProgress("フォルダーを列挙中", filesProcessed, path));
+                reportProgress(new ArchiveFolderComparisonProgress("フォルダーを列挙中", filesProcessed, path), false);
 
                 try
                 {

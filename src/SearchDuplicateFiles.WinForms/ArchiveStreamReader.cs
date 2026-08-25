@@ -34,6 +34,53 @@ internal static class ArchiveStreamReader
             throw;
         }
     }
+
+    public static ArchiveMetadataSession OpenMetadata(string archivePath)
+    {
+        var stream = new FileStream(
+            archivePath,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.Read,
+            BufferSize,
+            FileOptions.SequentialScan);
+
+        try
+        {
+            var options = ReaderOptions.ForExternalStream.WithExtensionHint(Path.GetFileName(archivePath));
+            var archive = ArchiveFactory.OpenArchive(stream, options);
+            return new ArchiveMetadataSession(archive, stream);
+        }
+        catch
+        {
+            stream.Dispose();
+            throw;
+        }
+    }
+}
+
+internal sealed class ArchiveMetadataSession : IDisposable
+{
+    private readonly Stream _stream;
+
+    public ArchiveMetadataSession(IArchive archive, Stream stream)
+    {
+        Archive = archive;
+        _stream = stream;
+    }
+
+    public IArchive Archive { get; }
+
+    public void Dispose()
+    {
+        Exception? firstException = null;
+        ArchiveReaderSession.TryDispose(Archive, ref firstException);
+        ArchiveReaderSession.TryDispose(_stream, ref firstException);
+        if (firstException is not null)
+        {
+            throw firstException;
+        }
+    }
 }
 
 internal sealed class ArchiveReaderSession : IDisposable
@@ -63,7 +110,7 @@ internal sealed class ArchiveReaderSession : IDisposable
         }
     }
 
-    private static void TryDispose(IDisposable disposable, ref Exception? firstException)
+    internal static void TryDispose(IDisposable disposable, ref Exception? firstException)
     {
         try
         {

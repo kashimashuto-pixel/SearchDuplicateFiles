@@ -25,6 +25,7 @@ public sealed class MainForm : Form
     private readonly ListBox _folderListBox = new();
     private readonly TextBox _fileNamePatternTextBox = new();
     private readonly TextBox _folderNamePatternTextBox = new();
+    private readonly ComboBox _comparisonModeBox = new();
     private readonly ComboBox _filterDisplayModeBox = new();
     private readonly NumericUpDown _minimumSizeBox = new();
     private readonly CheckBox _recursiveCheckBox = new();
@@ -183,6 +184,24 @@ public sealed class MainForm : Form
         _onlyAcrossFoldersCheckBox.Margin = new Padding(0, 6, 16, 0);
         _toolTip.SetToolTip(_onlyAcrossFoldersCheckBox, "フォルダーと圧縮ファイルなど、2つ以上の検索対象にまたがる重複だけを表示します。");
 
+        var comparisonModeLabel = new Label
+        {
+            Text = "判定方法",
+            AutoSize = true,
+            Margin = new Padding(0, 7, 6, 0)
+        };
+
+        _comparisonModeBox.DropDownStyle = ComboBoxStyle.DropDownList;
+        _comparisonModeBox.Items.AddRange(
+            Enum.GetValues<FileComparisonMode>()
+                .Select(mode => mode.ToDisplayText())
+                .Cast<object>()
+                .ToArray());
+        _comparisonModeBox.SelectedIndex = (int)FileComparisonMode.Content;
+        _comparisonModeBox.Width = 170;
+        _comparisonModeBox.Margin = new Padding(0, 3, 16, 0);
+        _toolTip.SetToolTip(_comparisonModeBox, "内容は現在と同じSHA-256判定です。ファイル名モードではフォルダー位置を問わず末尾の名前を比較します。");
+
         var fileNamePatternLabel = new Label
         {
             Text = "ファイル名",
@@ -246,6 +265,8 @@ public sealed class MainForm : Form
 
         panel.Controls.Add(_recursiveCheckBox);
         panel.Controls.Add(_includeHiddenCheckBox);
+        panel.Controls.Add(comparisonModeLabel);
+        panel.Controls.Add(_comparisonModeBox);
         panel.Controls.Add(_onlyAcrossFoldersCheckBox);
         panel.Controls.Add(fileNamePatternLabel);
         panel.Controls.Add(_fileNamePatternTextBox);
@@ -476,7 +497,8 @@ public sealed class MainForm : Form
             _recursiveCheckBox.Checked,
             _includeHiddenCheckBox.Checked,
             _lastOnlyAcrossFolders,
-            Decimal.ToInt64(_minimumSizeBox.Value) * 1024L);
+            Decimal.ToInt64(_minimumSizeBox.Value) * 1024L,
+            GetSelectedComparisonMode());
 
         _scanCancellation = new CancellationTokenSource();
         var cancellationToken = _scanCancellation.Token;
@@ -879,6 +901,7 @@ public sealed class MainForm : Form
         _statusLabel.Text = progress.Stage switch
         {
             ScanStage.Enumerating => $"列挙中: {progress.FilesSeen:N0} 件 {ShortenPath(progress.CurrentPath)}",
+            ScanStage.Comparing => $"ファイル名を比較中: {progress.FilesSeen:N0} 件",
             ScanStage.Hashing => $"内容確認中: {progress.FilesHashed:N0}/{progress.CandidateFiles:N0} 件 {ShortenPath(progress.CurrentPath)}",
             ScanStage.Finished => $"完了: {progress.DuplicateGroups:N0} グループ",
             _ => _statusLabel.Text
@@ -887,6 +910,7 @@ public sealed class MainForm : Form
         Text = progress.Stage switch
         {
             ScanStage.Enumerating => $"{AppTitle} - 列挙中 ({progress.FilesSeen:N0} 件)",
+            ScanStage.Comparing => $"{AppTitle} - ファイル名を比較中",
             ScanStage.Hashing => $"{AppTitle} - 内容確認中 ({progress.FilesHashed:N0}/{progress.CandidateFiles:N0})",
             ScanStage.Finished => $"{AppTitle} - 完了",
             _ => Text
@@ -902,6 +926,7 @@ public sealed class MainForm : Form
         _addArchiveButton.Enabled = !isScanning;
         _recursiveCheckBox.Enabled = !isScanning;
         _includeHiddenCheckBox.Enabled = !isScanning;
+        _comparisonModeBox.Enabled = !isScanning;
         _onlyAcrossFoldersCheckBox.Enabled = !isScanning;
         _fileNamePatternTextBox.Enabled = !isScanning;
         _folderNamePatternTextBox.Enabled = !isScanning;
@@ -1014,13 +1039,27 @@ public sealed class MainForm : Form
         var duplicateFileCount = visibleGroups.Sum(group => group.Files.Count);
         var reclaimableBytes = visibleGroups.Sum(group => (group.Files.Count - 1) * group.Size);
         var filterText = visibleGroups.Count == result.Groups.Count ? string.Empty : $" / 絞り込み {visibleGroups.Count:N0}/{result.Groups.Count:N0} グループ";
+        var comparisonModeText = $" / 判定 {result.ComparisonMode.ToDisplayText()}";
+        var hashText = result.ComparisonMode == FileComparisonMode.Content
+            ? $" / ハッシュ {result.FilesHashed:N0} 件"
+            : string.Empty;
 
         if (visibleGroups.Count == 0)
         {
-            return $"完了: 条件に一致する重複はありません。{targetText}{filterText} / 確認 {result.TotalFilesSeen:N0} 件 / ハッシュ {result.FilesHashed:N0} 件 / {result.Elapsed:mm\\:ss}{warningText}";
+            return $"完了: 条件に一致する重複はありません。{targetText}{comparisonModeText}{filterText} / 確認 {result.TotalFilesSeen:N0} 件{hashText} / {result.Elapsed:mm\\:ss}{warningText}";
         }
 
-        return $"完了: {visibleGroups.Count:N0} グループ / 重複候補 {duplicateFileCount:N0} 件 / 削減可能 {FormatSize(reclaimableBytes)}{filterText} / {targetText} / {result.Elapsed:mm\\:ss}{warningText}";
+        var reclaimableText = result.ComparisonMode == FileComparisonMode.Content
+            ? $" / 削減可能 {FormatSize(reclaimableBytes)}"
+            : string.Empty;
+        return $"完了: {visibleGroups.Count:N0} グループ / 一致候補 {duplicateFileCount:N0} 件{reclaimableText}{filterText} / {targetText}{comparisonModeText} / {result.Elapsed:mm\\:ss}{warningText}";
+    }
+
+    private FileComparisonMode GetSelectedComparisonMode()
+    {
+        return Enum.IsDefined(typeof(FileComparisonMode), _comparisonModeBox.SelectedIndex)
+            ? (FileComparisonMode)_comparisonModeBox.SelectedIndex
+            : FileComparisonMode.Content;
     }
 
     private static IReadOnlyList<string> ParsePatterns(string input)
