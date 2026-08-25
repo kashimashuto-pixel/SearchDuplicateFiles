@@ -28,9 +28,9 @@ Windows Forms で動作する重複ファイル検出ツールです。指定し
 ## 動作環境
 
 - Windows
-- .NET 8 Desktop Runtime
+- .NET 10 Desktop Runtime
 
-開発、ビルドには .NET 8 SDK 以降が必要です。
+開発、ビルドには .NET 10 SDK 以降が必要です。
 
 ## ビルド
 
@@ -58,7 +58,7 @@ dotnet publish src/SearchDuplicateFiles.WinForms/SearchDuplicateFiles.WinForms.c
 dotnet publish src/SearchDuplicateFiles.WinForms/SearchDuplicateFiles.WinForms.csproj -c Release -r win-x64 --self-contained true
 ```
 
-出力先は `src/SearchDuplicateFiles.WinForms/bin/Release/net8.0-windows/win-x64/publish/` です。
+出力先は `src/SearchDuplicateFiles.WinForms/bin/Release/net10.0-windows/win-x64/publish/` です。
 
 ## 使い方
 
