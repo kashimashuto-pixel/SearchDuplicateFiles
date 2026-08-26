@@ -1,6 +1,5 @@
 using System.ComponentModel;
 using System.Diagnostics;
-using System.IO.Enumeration;
 using System.Text;
 using Microsoft.VisualBasic.FileIO;
 
@@ -25,6 +24,8 @@ public sealed class MainForm : Form
     private readonly ListBox _folderListBox = new();
     private readonly TextBox _fileNamePatternTextBox = new();
     private readonly TextBox _folderNamePatternTextBox = new();
+    private readonly TextBox _excludedFileNamePatternTextBox = new();
+    private readonly TextBox _excludedFolderNamePatternTextBox = new();
     private readonly ComboBox _comparisonModeBox = new();
     private readonly ComboBox _filterDisplayModeBox = new();
     private readonly NumericUpDown _minimumSizeBox = new();
@@ -226,6 +227,28 @@ public sealed class MainForm : Form
         _folderNamePatternTextBox.Margin = new Padding(0, 3, 16, 0);
         _toolTip.SetToolTip(_folderNamePatternTextBox, "ファイルの親フォルダー名を部分一致またはワイルドカードで指定できます。複数条件は ; 区切りです。");
 
+        var excludedFileNamePatternLabel = new Label
+        {
+            Text = "除外ファイル名",
+            AutoSize = true,
+            Margin = new Padding(0, 7, 6, 0)
+        };
+
+        _excludedFileNamePatternTextBox.Width = 150;
+        _excludedFileNamePatternTextBox.Margin = new Padding(0, 3, 16, 0);
+        _toolTip.SetToolTip(_excludedFileNamePatternTextBox, "スキャンから除外するファイル名です。*.meta のように * と ? を使用でき、複数条件は ; 区切りです。");
+
+        var excludedFolderNamePatternLabel = new Label
+        {
+            Text = "除外フォルダー名",
+            AutoSize = true,
+            Margin = new Padding(0, 7, 6, 0)
+        };
+
+        _excludedFolderNamePatternTextBox.Width = 150;
+        _excludedFolderNamePatternTextBox.Margin = new Padding(0, 3, 16, 0);
+        _toolTip.SetToolTip(_excludedFolderNamePatternTextBox, "スキャンしないフォルダー名です。配下も除外され、複数条件は ; 区切りです。圧縮ファイル内にも適用されます。");
+
         var filterDisplayModeLabel = new Label
         {
             Text = "表示方法",
@@ -268,6 +291,10 @@ public sealed class MainForm : Form
         panel.Controls.Add(comparisonModeLabel);
         panel.Controls.Add(_comparisonModeBox);
         panel.Controls.Add(_onlyAcrossFoldersCheckBox);
+        panel.Controls.Add(excludedFileNamePatternLabel);
+        panel.Controls.Add(_excludedFileNamePatternTextBox);
+        panel.Controls.Add(excludedFolderNamePatternLabel);
+        panel.Controls.Add(_excludedFolderNamePatternTextBox);
         panel.Controls.Add(fileNamePatternLabel);
         panel.Controls.Add(_fileNamePatternTextBox);
         panel.Controls.Add(folderNamePatternLabel);
@@ -498,7 +525,9 @@ public sealed class MainForm : Form
             _includeHiddenCheckBox.Checked,
             _lastOnlyAcrossFolders,
             Decimal.ToInt64(_minimumSizeBox.Value) * 1024L,
-            GetSelectedComparisonMode());
+            GetSelectedComparisonMode(),
+            NamePatternMatcher.ParsePatterns(_excludedFileNamePatternTextBox.Text),
+            NamePatternMatcher.ParsePatterns(_excludedFolderNamePatternTextBox.Text));
 
         _scanCancellation = new CancellationTokenSource();
         var cancellationToken = _scanCancellation.Token;
@@ -928,6 +957,8 @@ public sealed class MainForm : Form
         _includeHiddenCheckBox.Enabled = !isScanning;
         _comparisonModeBox.Enabled = !isScanning;
         _onlyAcrossFoldersCheckBox.Enabled = !isScanning;
+        _excludedFileNamePatternTextBox.Enabled = !isScanning;
+        _excludedFolderNamePatternTextBox.Enabled = !isScanning;
         _fileNamePatternTextBox.Enabled = !isScanning;
         _folderNamePatternTextBox.Enabled = !isScanning;
         _filterDisplayModeBox.Enabled = !isScanning;
@@ -1064,12 +1095,9 @@ public sealed class MainForm : Form
 
     private static IReadOnlyList<string> ParsePatterns(string input)
     {
-        var patterns = input
-            .Split(new[] { ';', ',', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            .Where(pattern => !string.IsNullOrWhiteSpace(pattern))
-            .ToArray();
+        var patterns = NamePatternMatcher.ParsePatterns(input);
 
-        return patterns.Length == 0 ? new[] { "*" } : patterns;
+        return patterns.Count == 0 ? new[] { "*" } : patterns;
     }
 
     private static bool FileMatchesPatterns(
@@ -1087,9 +1115,7 @@ public sealed class MainForm : Form
 
     private static bool MatchesName(string name, string pattern)
     {
-        return pattern.IndexOfAny(['*', '?']) >= 0
-            ? FileSystemName.MatchesSimpleExpression(pattern, name, ignoreCase: true)
-            : name.Contains(pattern, StringComparison.CurrentCultureIgnoreCase);
+        return NamePatternMatcher.MatchesName(name, pattern);
     }
 
     private static string NormalizeFolderPath(string folderPath)

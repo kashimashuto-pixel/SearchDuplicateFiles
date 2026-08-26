@@ -12,7 +12,9 @@ public sealed record ScanOptions(
     bool IncludeHiddenAndSystemFiles,
     bool OnlyShowAcrossDifferentRootFolders,
     long MinimumSizeBytes,
-    FileComparisonMode ComparisonMode = FileComparisonMode.Content);
+    FileComparisonMode ComparisonMode = FileComparisonMode.Content,
+    IReadOnlyList<string>? ExcludedFileNamePatterns = null,
+    IReadOnlyList<string>? ExcludedFolderNamePatterns = null);
 
 public sealed record DuplicateFile(
     string FullPath,
@@ -324,57 +326,76 @@ public sealed class DuplicateScanner
         ref int filesSeen,
         CancellationToken cancellationToken)
     {
-        IEnumerable<string> files;
+        var pendingDirectories = new Stack<string>();
+        var enumerationOptions = CreateEnumerationOptions(options);
+        pendingDirectories.Push(rootPath);
 
-        try
+        while (pendingDirectories.TryPop(out var currentDirectory))
         {
-            files = Directory.EnumerateFiles(rootPath, "*", CreateEnumerationOptions(options));
-        }
-        catch (Exception ex) when (IsExpectedFileException(ex))
-        {
-            warnings.Add($"列挙できませんでした: {rootPath} ({ex.Message})");
-            return;
-        }
+            cancellationToken.ThrowIfCancellationRequested();
 
-        try
-        {
-            foreach (var path in files)
+            try
             {
-                cancellationToken.ThrowIfCancellationRequested();
-
-                if (!seenPaths.Add(path))
+                foreach (var path in Directory.EnumerateFiles(currentDirectory, "*", enumerationOptions))
                 {
-                    continue;
-                }
+                    cancellationToken.ThrowIfCancellationRequested();
 
-                filesSeen++;
-                reportProgress(new ScanProgress(ScanStage.Enumerating, filesSeen, 0, 0, 0, path), false);
-
-                FileInfo fileInfo;
-                try
-                {
-                    fileInfo = new FileInfo(path);
-                    if (!fileInfo.Exists || fileInfo.Length < options.MinimumSizeBytes)
+                    if (IsExcludedFileName(Path.GetFileName(path), options)
+                        || !seenPaths.Add(path))
                     {
                         continue;
                     }
-                }
-                catch (Exception ex) when (IsExpectedFileException(ex))
-                {
-                    warnings.Add($"スキップ: 情報を取得できませんでした: {path} ({ex.Message})");
-                    continue;
-                }
 
-                AddCandidate(filesBySize, new FileCandidate(
-                    fileInfo.FullName,
-                    rootPath,
-                    fileInfo.Length,
-                    fileInfo.LastWriteTimeUtc));
+                    filesSeen++;
+                    reportProgress(new ScanProgress(ScanStage.Enumerating, filesSeen, 0, 0, 0, path), false);
+
+                    FileInfo fileInfo;
+                    try
+                    {
+                        fileInfo = new FileInfo(path);
+                        if (!fileInfo.Exists || fileInfo.Length < options.MinimumSizeBytes)
+                        {
+                            continue;
+                        }
+                    }
+                    catch (Exception ex) when (IsExpectedFileException(ex))
+                    {
+                        warnings.Add($"スキップ: 情報を取得できませんでした: {path} ({ex.Message})");
+                        continue;
+                    }
+
+                    AddCandidate(filesBySize, new FileCandidate(
+                        fileInfo.FullName,
+                        rootPath,
+                        fileInfo.Length,
+                        fileInfo.LastWriteTimeUtc));
+                }
             }
-        }
-        catch (Exception ex) when (IsExpectedFileException(ex))
-        {
-            warnings.Add($"列挙中にエラーが発生しました: {rootPath} ({ex.Message})");
+            catch (Exception ex) when (IsExpectedFileException(ex))
+            {
+                warnings.Add($"列挙できませんでした: {currentDirectory} ({ex.Message})");
+            }
+
+            if (!options.IncludeSubdirectories)
+            {
+                continue;
+            }
+
+            try
+            {
+                foreach (var directory in Directory.EnumerateDirectories(currentDirectory, "*", enumerationOptions))
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    if (!IsExcludedFolderName(Path.GetFileName(Path.TrimEndingDirectorySeparator(directory)), options))
+                    {
+                        pendingDirectories.Push(directory);
+                    }
+                }
+            }
+            catch (Exception ex) when (IsExpectedFileException(ex))
+            {
+                warnings.Add($"サブフォルダーを列挙できませんでした: {currentDirectory} ({ex.Message})");
+            }
         }
     }
 
@@ -412,6 +433,11 @@ public sealed class DuplicateScanner
                 }
 
                 var entryPath = NormalizeArchiveEntryPath(entry.Key, entryIndex);
+                if (IsExcludedArchiveEntry(entryPath, options))
+                {
+                    return true;
+                }
+
                 archiveFilesSeen++;
                 var displayPath = CreateArchiveDisplayPath(archivePath, entryPath);
                 reportProgress(new ScanProgress(ScanStage.Enumerating, archiveFilesSeen, 0, 0, 0, displayPath), false);
@@ -582,6 +608,30 @@ public sealed class DuplicateScanner
         return (attributes & (FileAttributes.Hidden | FileAttributes.System)) != 0;
     }
 
+    private static bool IsExcludedArchiveEntry(string entryPath, ScanOptions options)
+    {
+        var pathSegments = entryPath
+            .Replace('\\', '/')
+            .Split('/', StringSplitOptions.RemoveEmptyEntries);
+        if (pathSegments.Length == 0)
+        {
+            return false;
+        }
+
+        return IsExcludedFileName(pathSegments[^1], options)
+            || pathSegments[..^1].Any(segment => IsExcludedFolderName(segment, options));
+    }
+
+    private static bool IsExcludedFileName(string fileName, ScanOptions options)
+    {
+        return NamePatternMatcher.IsMatch(fileName, options.ExcludedFileNamePatterns);
+    }
+
+    private static bool IsExcludedFolderName(string folderName, ScanOptions options)
+    {
+        return NamePatternMatcher.IsMatch(folderName, options.ExcludedFolderNamePatterns);
+    }
+
     private static void AddCandidate(Dictionary<long, List<FileCandidate>> filesBySize, FileCandidate candidate)
     {
         if (!filesBySize.TryGetValue(candidate.Size, out var list))
@@ -603,7 +653,7 @@ public sealed class DuplicateScanner
 
         return new EnumerationOptions
         {
-            RecurseSubdirectories = options.IncludeSubdirectories,
+            RecurseSubdirectories = false,
             IgnoreInaccessible = true,
             ReturnSpecialDirectories = false,
             AttributesToSkip = attributesToSkip,
